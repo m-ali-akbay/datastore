@@ -44,11 +44,13 @@ pub fn main() {
         };
 
         let mut found_any = false;
+        let mut key_buf = Vec::new();
+        let mut value_buf = Vec::new();
         loop {
             match iter.next() {
                 Ok(Some(mut entry)) => {
                     found_any = true;
-                    let key_buf = {
+                    let key = {
                         let mut key_reader = match entry.key() {
                             Ok(r) => r,
                             Err(e) => {
@@ -56,14 +58,15 @@ pub fn main() {
                                 process::exit(1);
                             }
                         };
-                        let mut key_buf = Vec::new();
+                        
+                        key_buf.clear();
                         if let Err(e) = key_reader.read_to_end(&mut key_buf) {
                             eprintln!("Failed to read key: {}", e);
                             process::exit(1);
                         }
-                        key_buf
+                        &key_buf[..]
                     };
-                    let value_buf = {
+                    let value = {
                         let mut value_reader = match entry.value() {
                             Ok(r) => r,
                             Err(e) => {
@@ -71,14 +74,15 @@ pub fn main() {
                                 process::exit(1);
                             }
                         };
-                        let mut value_buf = Vec::new();
+
+                        value_buf.clear();
                         if let Err(e) = value_reader.read_to_end(&mut value_buf) {
                             eprintln!("Failed to read value: {}", e);
                             process::exit(1);
                         }
-                        value_buf
+                        &value_buf[..]
                     };
-                    println!("Key: {:?}, Value: {:?}", String::from_utf8_lossy(&key_buf), String::from_utf8_lossy(&value_buf));
+                    println!("Key: {:?}, Value: {:?}", String::from_utf8_lossy(&key), String::from_utf8_lossy(&value));
                 },
                 Ok(None) => break,
                 Err(e) => {

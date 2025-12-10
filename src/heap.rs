@@ -147,7 +147,7 @@ impl<Pages: PageStorage> FastHeapIterator<Pages> {
         })
     }
 
-    fn next_entry_header(&mut self) -> Result<Option<(usize, FastHeapEntryHeader, usize)>, HeapStorageError> {
+    fn next_head_entry_header(&mut self) -> Result<Option<(usize, FastHeapEntryHeader, usize)>, HeapStorageError> {
         loop {
             let mut occupied_size = self.current_page.occupied_size()?;
             // TODO: handle overflow of entry offset
@@ -161,6 +161,10 @@ impl<Pages: PageStorage> FastHeapIterator<Pages> {
             }
 
             let header = FastHeapEntryHeader::load_from(self.current_entry_offset, &self.current_page)?;
+            if !header.head {
+                self.current_entry_offset += FastHeapEntryHeader::SIZE + header.payload_length as usize;
+                continue;
+            }
 
             let payload_offset = self.current_entry_offset + FastHeapEntryHeader::SIZE;
 
@@ -173,7 +177,7 @@ impl<Pages: PageStorage> FastHeapIterator<Pages> {
 
 impl<Pages: PageStorage> HeapEntryIterator for RefCell<FastHeapIterator<Pages>> {
     fn next(&self) -> Result<Option<impl Read>, HeapStorageError> {
-        let Some((page_index, header, payload_offset)) = self.borrow_mut().next_entry_header()? else {
+        let Some((page_index, header, payload_offset)) = self.borrow_mut().next_head_entry_header()? else {
             return Ok(None);
         };
 
@@ -189,7 +193,7 @@ impl<Pages: PageStorage> HeapEntryIterator for RefCell<FastHeapIterator<Pages>> 
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 struct FastHeapEntryPointer {
     page_index: u32,
     entry_offset: u16,
@@ -215,6 +219,7 @@ impl FastHeapEntryPointer {
     }
 }
 
+#[derive(Debug)]
 struct FastHeapEntryHeader {
     head: bool,
     next: Option<FastHeapEntryPointer>,

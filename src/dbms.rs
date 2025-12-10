@@ -1,34 +1,31 @@
-use std::{fs::create_dir_all, io::Read, path::Path, sync::Arc};
+pub mod keymap;
 
-use serde::{Deserialize, Serialize};
+use std::{fs::{File, create_dir_all, rename}, io::{Read, Seek}, path::{Path, PathBuf}};
 
-use crate::{block::{fs::FileBlockStorage, range::{RangeBlockStorage, RangeBlockStorageError}}, heap::FastHeapStorage, keymap::{HeapKeyMap, KeyMap, KeyMapEntryReader, KeyMapError, KeyMapIterator}, page::{FastPageStorage, OCCUPIED_SIZE_BYTES, PageStorageError}};
+use crate::{dbms::keymap::{KeyMapConfig, KeyMapOpenError, ManagedKeyMap, open_key_map}, heap::HeapStorageError, keymap::{KeyMap, KeyMapEntryReader, KeyMapError, KeyMapIterator}};
 
 #[derive(thiserror::Error, Debug)]
 pub enum KVStoreError {
     #[error("I/O error: {0}")]
     IOError(#[from] std::io::Error),
 
-    #[error("Configuration mismatch")]
-    ConfigMismatch(KVStoreConfig),
+    #[error("Block size configuration mismatch: expected {0} bytes")]
+    BlockSizeConfigMismatch(usize),
 
     #[error("Invalid metadata")]
     InvalidMetadata,
 
-    #[error("Page storage error: {0}")]
-    PageStorageError(#[from] PageStorageError),
+    #[error("Key map open error: {0}")]
+    KeyMapOpenError(#[from] KeyMapOpenError),
 
     #[error("Key map error: {0}")]
     KeyMapError(#[from] KeyMapError),
-
-    #[error("Range block storage error: {0}")]
-    RangeBlockStorageError(#[from] RangeBlockStorageError),
 
     #[error("Key not found")]
     KeyNotFound,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 pub struct KVStoreConfig {
     pub block_size: usize,
     pub page_count: usize,
@@ -46,11 +43,15 @@ impl Default for KVStoreConfig {
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Metadata {
     #[serde(flatten)]
-    config: KVStoreConfig,
+    config: KeyMapConfig,
+    revision: u64,
 }
 
 pub struct KVStore {
-    keymap: HeapKeyMap<Arc<FastHeapStorage<Arc<FastPageStorage<RangeBlockStorage<Arc<FileBlockStorage>>, RangeBlockStorage<Arc<FileBlockStorage>>>>>>>,
+    dir_path: PathBuf,
+    metadata_file: File,
+    metadata: Metadata,
+    keymap: ManagedKeyMap,
 }
 
 impl KVStore {
@@ -58,73 +59,46 @@ impl KVStore {
         create_dir_all(&dir_path)?;
 
         let metadata_path = dir_path.as_ref().join("metadata.json");
-        let pages_path = dir_path.as_ref().join("pages.bin");
 
-        let page_header_block_count = config.page_count * OCCUPIED_SIZE_BYTES / config.block_size
-            + if (config.page_count * OCCUPIED_SIZE_BYTES) % config.block_size != 0 {
-                1
-            } else {
-                0
-            };
-
-        let pages_file = if metadata_path.try_exists()? {
+        let (metadata, metadata_file) = if metadata_path.try_exists()? {
             let metadata_file = std::fs::OpenOptions::new()
                 .read(true)
+                .write(true)
                 .open(&metadata_path)?;
-            let metadata: Metadata = serde_json::from_reader(metadata_file)
+            let metadata: Metadata = serde_json::from_reader(&metadata_file)
                 .map_err(|_| KVStoreError::InvalidMetadata)?;
 
-            if metadata.config != config {
-                return Err(KVStoreError::ConfigMismatch(metadata.config));
+            if metadata.config.block_size != config.block_size {
+                return Err(KVStoreError::BlockSizeConfigMismatch(metadata.config.block_size));
             }
 
-            let pages_file = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&pages_path)?;
-
-            pages_file
+            (metadata, metadata_file)
         } else {
             let metadata_file = std::fs::OpenOptions::new()
                 .write(true)
                 .create(true)
                 .open(&metadata_path)?;
             let metadata = Metadata {
-                config: config.clone(),
+                config: KeyMapConfig {
+                    block_size: config.block_size,
+                    page_count: config.page_count,
+                },
+                revision: 0,
             };
 
-            serde_json::to_writer_pretty(metadata_file, &metadata)
+            serde_json::to_writer_pretty(&metadata_file, &metadata)
                 .map_err(|_| KVStoreError::InvalidMetadata)?;
 
-            let pages_file = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .open(&pages_path)?;
-
-            pages_file.set_len(
-                (
-                    page_header_block_count * config.block_size
-                    + config.page_count * config.block_size
-                ) as u64
-            )?;
-
-            pages_file
+            (metadata, metadata_file)
         };
 
-        let pages = Arc::new(FileBlockStorage::new(pages_file, config.block_size, page_header_block_count + config.page_count)?);
-
-        let header = RangeBlockStorage::new(pages.clone(), 0..page_header_block_count)?;
-        let pages = RangeBlockStorage::new(pages.clone(), page_header_block_count..(page_header_block_count + config.page_count))?;
-
-        let page_storage =
-            Arc::new(FastPageStorage::new(header, pages)?);
-
-        let heap_storage = Arc::new(FastHeapStorage::new(page_storage));
-
-        let keymap = HeapKeyMap::new(heap_storage);
+        let pages_path = dir_path.as_ref().join(format!("pages.rev-{}.dat", metadata.revision));
+        let keymap = open_key_map(pages_path, metadata.config.clone())?;
 
         Ok(KVStore {
+            dir_path: dir_path.as_ref().to_path_buf(),
+            metadata_file,
+            metadata,
             keymap,
         })
     }
@@ -132,7 +106,60 @@ impl KVStore {
 
 impl KVStore {
     pub fn insert(&mut self, key: &[u8], value: &[u8]) -> Result<(), KVStoreError> {
-        Ok(self.keymap.insert(key, value)?)
+        match self.keymap.insert(key, value) {
+            Ok(()) => Ok(()),
+            Err(KeyMapError::HeapStorageError(HeapStorageError::FullHeap)) => {
+                let tmp_pages_path = self.dir_path.join(format!("pages.rev-{}.dat.tmp", self.metadata.revision + 1));
+                let pages_path = self.dir_path.join(format!("pages.rev-{}.dat", self.metadata.revision + 1));
+
+                if tmp_pages_path.try_exists()? {
+                    std::fs::remove_file(&tmp_pages_path)?;
+                }
+
+                let mut config = self.metadata.config.clone();
+                config.page_count += config.page_count / 2;
+                let mut keymap = open_key_map(&tmp_pages_path, config.clone())?;
+
+                let mut iter = self.keymap.iter(None)?;
+                let mut key_buffer = Vec::new();
+                let mut value_buffer = Vec::new();
+                loop {
+                    let Some(mut entry) = KeyMapIterator::next(&mut iter)? else {
+                        break;
+                    };
+                    key_buffer.clear();
+                    value_buffer.clear();
+                    {
+                        let mut key_reader = KeyMapEntryReader::key(&mut entry)?;
+                        key_reader.read_to_end(&mut key_buffer)?;
+                    }
+                    {
+                        let mut value_reader = KeyMapEntryReader::value(&mut entry)?;
+                        value_reader.read_to_end(&mut value_buffer)?;
+                    }
+
+                    keymap.insert(&key_buffer, &value_buffer)?;
+                }
+                drop(iter);
+
+                rename(&tmp_pages_path, &pages_path)?;
+
+                self.metadata.config = config;
+                self.metadata.revision += 1;
+                self.metadata_file.set_len(0)?;
+                self.metadata_file.seek(std::io::SeekFrom::Start(0))?;
+                serde_json::to_writer_pretty(&self.metadata_file, &self.metadata)
+                    .map_err(|_| KVStoreError::InvalidMetadata)?;
+                self.keymap = keymap;
+
+                let old_revision = self.metadata.revision - 1;
+                let old_pages_path = self.dir_path.join(format!("pages.rev-{}.dat", old_revision));
+                std::fs::remove_file(&old_pages_path)?;
+
+                Ok(self.keymap.insert(key, value)?)
+            },
+            Err(err) => Err(err.into()),
+        }
     }
 
     pub fn get<'buf>(&self, key: &[u8], buffer: &'buf mut Vec<u8>) -> Result<&'buf [u8], KVStoreError> {
