@@ -1,208 +1,188 @@
-pub mod keymap;
+use std::{fs::{create_dir_all, rename}, io::{self, Write}, path::{Path, PathBuf}};
 
-use std::{fs::{File, create_dir_all, rename}, io::{Read, Seek}, path::{Path, PathBuf}};
+use crate::{book::{self, SectionIndex, SectionPageIndex, pager::PagerBook}, hash_table::{self, HashTable, book::BookHashTable, prefix_hasher::PrefixHasherBuilder}, pager::{PageIndex, PageSize, fs::FilePager}};
 
-use crate::{dbms::keymap::{KeyMapConfig, KeyMapOpenError, ManagedKeyMap, open_key_map}, heap::HeapStorageError, keymap::{KeyMap, KeyMapEntryReader, KeyMapError, KeyMapIterator}};
-
-#[derive(thiserror::Error, Debug)]
-pub enum KVStoreError {
-    #[error("I/O error: {0}")]
-    IOError(#[from] std::io::Error),
-
-    #[error("Block size configuration mismatch: expected {0} bytes")]
-    BlockSizeConfigMismatch(usize),
-
-    #[error("Invalid metadata")]
-    InvalidMetadata,
-
-    #[error("Key map open error: {0}")]
-    KeyMapOpenError(#[from] KeyMapOpenError),
-
-    #[error("Key map error: {0}")]
-    KeyMapError(#[from] KeyMapError),
-
-    #[error("Key not found")]
-    KeyNotFound,
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct HashTableConfig {
+    pub page_size: PageSize,
+    pub section_count: SectionIndex,
 }
 
-#[derive(Clone, Debug)]
-pub struct KVStoreConfig {
-    pub block_size: usize,
-    pub page_count: usize,
-}
-
-impl Default for KVStoreConfig {
+impl Default for HashTableConfig {
     fn default() -> Self {
-        KVStoreConfig {
-            block_size: 4096,
-            page_count: 1024,
+        HashTableConfig {
+            page_size: 4096,
+            section_count: 1024,
         }
     }
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
-struct Metadata {
+struct SectionHeader {
+    index: SectionIndex,
+    end_offset: u64,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PageHeader {
+    section_index: SectionIndex,
+    page_index: PageIndex,
+    section_page_index: SectionPageIndex,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Header {
     #[serde(flatten)]
-    config: KeyMapConfig,
-    revision: u64,
+    config: HashTableConfig,
+    sections: Vec<SectionHeader>,
+    pages: Vec<PageHeader>,
 }
 
-pub struct KVStore {
+type THashTable = BookHashTable<PrefixHasherBuilder, PagerBook<FilePager>>;
+
+pub struct ManagedHashTable {
     dir_path: PathBuf,
-    metadata_file: File,
-    metadata: Metadata,
-    keymap: ManagedKeyMap,
+    config: HashTableConfig,
+    hash_table: THashTable,
 }
 
-impl KVStore {
-    pub fn open(dir_path: impl AsRef<Path>, config: KVStoreConfig) -> Result<Self, KVStoreError> {
+impl ManagedHashTable {
+    pub fn open(dir_path: impl AsRef<Path>, config: HashTableConfig) -> io::Result<Self> {
         create_dir_all(&dir_path)?;
 
-        let metadata_path = dir_path.as_ref().join("metadata.json");
+        let header_path = dir_path.as_ref().join("header.json");
 
-        let (metadata, metadata_file) = if metadata_path.try_exists()? {
-            let metadata_file = std::fs::OpenOptions::new()
+        let header = if header_path.try_exists()? {
+            let header_file = std::fs::OpenOptions::new()
                 .read(true)
-                .write(true)
-                .open(&metadata_path)?;
-            let metadata: Metadata = serde_json::from_reader(&metadata_file)
-                .map_err(|_| KVStoreError::InvalidMetadata)?;
+                .open(&header_path)?;
+            let header: Header = serde_json::from_reader(&header_file)
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, format!("Failed to parse metadata: {}", err)))?;
 
-            if metadata.config.block_size != config.block_size {
-                return Err(KVStoreError::BlockSizeConfigMismatch(metadata.config.block_size));
+            if header.config.page_size != config.page_size {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "Page size in metadata does not match the provided configuration"));
             }
 
-            (metadata, metadata_file)
+            if header.config.section_count != config.section_count {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "Section count in metadata does not match the provided configuration"));
+            }
+
+            header
         } else {
-            let metadata_file = std::fs::OpenOptions::new()
+            let header_file = std::fs::OpenOptions::new()
                 .write(true)
                 .create(true)
-                .open(&metadata_path)?;
-            let metadata = Metadata {
-                config: KeyMapConfig {
-                    block_size: config.block_size,
-                    page_count: config.page_count,
-                },
-                revision: 0,
+                .open(&header_path)?;
+            let header = Header {
+                config,
+                sections: Vec::new(),
+                pages: Vec::new(),
             };
 
-            serde_json::to_writer_pretty(&metadata_file, &metadata)
-                .map_err(|_| KVStoreError::InvalidMetadata)?;
+            serde_json::to_writer_pretty(&header_file, &header)
+                .map_err(|err| io::Error::new(io::ErrorKind::Other, format!("Failed to write metadata: {}", err)))?;
 
-            (metadata, metadata_file)
+            header
         };
 
-        let pages_path = dir_path.as_ref().join(format!("pages.rev-{}.dat", metadata.revision));
-        let keymap = open_key_map(pages_path, metadata.config.clone())?;
+        let pages_path = dir_path.as_ref().join("pages.dat");
 
-        Ok(KVStore {
+        let pages_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&pages_path)?;
+
+        let pager = FilePager::new(pages_file, header.config.page_size)?;
+
+        let book = PagerBook::load(
+            pager,
+            header.pages.iter().map(|ph| (book::pager::PageKey {
+                section_index: ph.section_index,
+                section_page_index: ph.section_page_index,
+            }, book::pager::PageHeader {
+                pager_page_index: ph.page_index,
+            })),
+        )?;
+
+        let hash_table = BookHashTable::load(
+            PrefixHasherBuilder,
+            book,
+            header.config.section_count,
+            header.sections.iter().map(|sh| (sh.index, hash_table::book::SectionHeader {
+                end_offset: sh.end_offset,
+            })),
+        )?;
+
+        Ok(ManagedHashTable {
             dir_path: dir_path.as_ref().to_path_buf(),
-            metadata_file,
-            metadata,
-            keymap,
+            config: header.config,
+            hash_table,
         })
     }
 }
 
-impl KVStore {
-    pub fn insert(&mut self, key: &[u8], value: &[u8]) -> Result<(), KVStoreError> {
-        match self.keymap.insert(key, value) {
-            Ok(()) => Ok(()),
-            Err(KeyMapError::HeapStorageError(HeapStorageError::FullHeap)) => {
-                let tmp_pages_path = self.dir_path.join(format!("pages.rev-{}.dat.tmp", self.metadata.revision + 1));
-                let pages_path = self.dir_path.join(format!("pages.rev-{}.dat", self.metadata.revision + 1));
-
-                if tmp_pages_path.try_exists()? {
-                    std::fs::remove_file(&tmp_pages_path)?;
-                }
-
-                let mut config = self.metadata.config.clone();
-                config.page_count += config.page_count / 2;
-                let mut keymap = open_key_map(&tmp_pages_path, config.clone())?;
-
-                let mut iter = self.keymap.iter(None)?;
-                let mut key_buffer = Vec::new();
-                let mut value_buffer = Vec::new();
-                loop {
-                    let Some(mut entry) = KeyMapIterator::next(&mut iter)? else {
-                        break;
-                    };
-                    key_buffer.clear();
-                    value_buffer.clear();
-                    {
-                        let mut key_reader = KeyMapEntryReader::key(&mut entry)?;
-                        key_reader.read_to_end(&mut key_buffer)?;
+impl ManagedHashTable {
+    pub fn save(&mut self) -> io::Result<()> {
+        let (sections, pages) = self.hash_table.export(|book, sections| -> io::Result<_> {
+            let pages = book.export(|pager, pages| -> io::Result<_> {
+                pager.flush()?;
+                Ok(pages.map(|(page_key, page_header)| {
+                    PageHeader {
+                        section_index: page_key.section_index,
+                        section_page_index: page_key.section_page_index,
+                        page_index: page_header.pager_page_index,
                     }
-                    {
-                        let mut value_reader = KeyMapEntryReader::value(&mut entry)?;
-                        value_reader.read_to_end(&mut value_buffer)?;
-                    }
+                }).collect())
+            })??;
 
-                    keymap.insert(&key_buffer, &value_buffer)?;
+            let sections = sections.map(|(section_index, section_header)| {
+                SectionHeader {
+                    index: section_index,
+                    end_offset: section_header.end_offset,
                 }
-                drop(iter);
+            }).collect();
 
-                rename(&tmp_pages_path, &pages_path)?;
+            Ok((sections, pages))
+        })??;
 
-                self.metadata.config = config;
-                self.metadata.revision += 1;
-                self.metadata_file.set_len(0)?;
-                self.metadata_file.seek(std::io::SeekFrom::Start(0))?;
-                serde_json::to_writer_pretty(&self.metadata_file, &self.metadata)
-                    .map_err(|_| KVStoreError::InvalidMetadata)?;
-                self.keymap = keymap;
-
-                let old_revision = self.metadata.revision - 1;
-                let old_pages_path = self.dir_path.join(format!("pages.rev-{}.dat", old_revision));
-                std::fs::remove_file(&old_pages_path)?;
-
-                Ok(self.keymap.insert(key, value)?)
-            },
-            Err(err) => Err(err.into()),
-        }
-    }
-
-    pub fn get<'buf>(&self, key: &[u8], buffer: &'buf mut Vec<u8>) -> Result<&'buf [u8], KVStoreError> {
-        let mut iter = self.keymap.iter(Some(key))?;
-        let Some(mut entry) = KeyMapIterator::next(&mut iter)? else {
-            return Err(KVStoreError::KeyNotFound);
+        let header = Header {
+            config: self.config.clone(),
+            sections,
+            pages,
         };
-        let mut value_reader = KeyMapEntryReader::value(&mut entry)?;
-        let offset = buffer.len();
-        let len = value_reader.read_to_end(buffer)?;
-        Ok(&buffer[offset..offset + len])
-    }
 
-    pub fn iter(&self, key: Option<&[u8]>) -> Result<impl KVStoreIterator, KVStoreError> {
-        Ok(self.keymap.iter(key)?)
-    }
-}
+        let tmp_header_path = self.dir_path.join("header.json.tmp");
+        let mut tmp_header_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_header_path)?;
 
-pub trait KVStoreIterator {
-    fn next(&mut self) -> Result<Option<impl KVStoreEntryReader>, KVStoreError>;
-}
+        serde_json::to_writer_pretty(&mut tmp_header_file, &header)
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, format!("Failed to write metadata: {}", err)))?;
 
-impl<T: KeyMapIterator> KVStoreIterator for T {
-    fn next(&mut self) -> Result<Option<impl KVStoreEntryReader>, KVStoreError> {
-        match self.next() {
-            Ok(Some(entry)) => Ok(Some(entry)),
-            Ok(None) => Ok(None),
-            Err(e) => Err(KVStoreError::from(e)),
-        }
+        tmp_header_file.flush()?;
+        rename(&tmp_header_path, &self.dir_path.join("header.json"))?;
+
+        Ok(())
     }
 }
 
-pub trait KVStoreEntryReader {
-    fn key(&mut self) -> std::io::Result<impl Read>;
-    fn value(&mut self) -> std::io::Result<impl Read>;
-}
-
-impl<T: KeyMapEntryReader> KVStoreEntryReader for T {
-    fn key(&mut self) -> std::io::Result<impl Read> {
-        self.key()
+impl HashTable for ManagedHashTable {
+    fn insert(&mut self, key: &[u8], value: &[u8]) -> io::Result<()> {
+        self.hash_table.insert(key, value)
     }
 
-    fn value(&mut self) -> std::io::Result<impl Read> {
-        self.value()
+    fn scan_key(&self, key: &[u8]) -> io::Result<impl hash_table::HashTableScanner> {
+        self.hash_table.scan_key(key)
+    }
+
+    fn scan_hash(&self, hash: hash_table::Hash) -> io::Result<impl hash_table::HashTableScanner> {
+        self.hash_table.scan_hash(hash)
+    }
+
+    fn scan_all(&self) -> io::Result<impl hash_table::HashTableScanner> {
+        self.hash_table.scan_all()
     }
 }
