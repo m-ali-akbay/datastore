@@ -315,7 +315,10 @@ impl<'a, Reader: Read + Seek + Clone> SectionScanner<'a, Reader> {
                 return Ok(None);
             };
             if (index_header.bloom_filter & bloom_query) == 0 {
-                let next_index_header = self.index_headers.range((Bound::Excluded(index_key), Bound::Unbounded)).next();
+                let next_index_header = self.index_headers.range((Bound::Excluded(index_key), Bound::Excluded(IndexKey {
+                    section_index: index_key.section_index + 1,
+                    index_chunk: 0,
+                }))).next();
                 let next_position = match next_index_header {
                     Some((_, IndexHeader { first_entry_offset, .. })) => *first_entry_offset,
                     None => self.section_end,
