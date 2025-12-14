@@ -5,6 +5,7 @@ use datastore::{dbms::{HashTableConfig, ManagedHashTable}, hash_table::{HashTabl
 pub fn main() {
     let mut config: HashTableConfig = Default::default();
     config.page_size = 64;
+    config.index_chunk_size = 64;
     config.section_count = 4;
 
     let mut hash_table = match ManagedHashTable::open("dev/example-hash-table", config) {
@@ -15,23 +16,20 @@ pub fn main() {
         }
     };
 
-    // arguments:
-    // - "key value" to insert key-value pair
-    // - "key" to get value for key
-    // - no arguments to iterate all key-value pairs
     let args: Vec<String> = std::env::args().collect();
-    if args.len() == 3 {
-        let key = &args[1];
-        let value = &args[2];
+    if args.len() == 4 && args[1] == "insert" {
+        let key = &args[2];
+        let value = &args[3];
         if let Err(e) = hash_table.insert(key.as_bytes(), value.as_bytes()) {
             eprintln!("Failed to insert key-value pair: {}", e);
             process::exit(1);
         }
         println!("Inserted key-value pair: {:?} -> {:?}", key, value);
-    } else if args.len() == 2 || args.len() == 1 {
-        let mut scanner = match hash_table.scan(match args.get(1) {
-            Some(key) => HashTableScanFilter::Key(key.as_bytes()),
-            None => HashTableScanFilter::All,
+    } else if (args.len() == 3 && args[1] == "scan-key") || (args.len() == 2 && args[1] == "scan") {
+        let mut scanner = match hash_table.scan(match args[1].as_str() {
+            "scan-key" => HashTableScanFilter::Key(args[2].as_bytes()),
+            "scan" => HashTableScanFilter::All,
+            _ => unreachable!(),
         }) {
             Ok(it) => it,
             Err(e) => {
@@ -92,9 +90,9 @@ pub fn main() {
         }
     } else {
         println!("Usage:");
-        println!("  To insert: {} <key> <value>", args[0]);
-        println!("  To get:    {} <key>", args[0]);
-        println!("  To iterate all: {}", args[0]);
+        println!("  To insert:      {} insert <key> <value>", args[0]);
+        println!("  To scan by key: {} scan-key <key>", args[0]);
+        println!("  To scan all:    {} scan", args[0]);
         process::exit(1);
     }
 

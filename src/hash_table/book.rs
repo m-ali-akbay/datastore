@@ -1,4 +1,4 @@
-use std::{cmp::Ordering, collections::BTreeMap, io::{self, Read, Seek, SeekFrom, Write}, mem::replace};
+use std::{cmp::Ordering, collections::BTreeMap, io::{self, Read, Seek, SeekFrom, Write}, mem::replace, ops::Bound};
 
 use crate::{book::{Book, SectionIndex}, hash_table::{HashTable, HashTableEntry, HashTableScanner, SliceHasher, SliceHasherBuilder}};
 
@@ -8,11 +8,27 @@ pub struct SectionHeader {
     pub end_offset: u64,
 }
 
+pub type IndexChunk = u32;
+pub type IndexChunkSize = u32;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct IndexKey {
+    pub section_index: SectionIndex,
+    pub index_chunk: IndexChunk,
+}
+
+pub struct IndexHeader {
+    pub bloom_filter: u64,
+    pub first_entry_offset: u64,
+}
+
 pub struct BookHashTable<H, B> {
     hasher_builder: H,
     book: B,
     section_count: SectionIndex,
     sections: BTreeMap<SectionIndex, SectionHeader>,
+    index_chunk_size: IndexChunkSize,
+    indexes: BTreeMap<IndexKey, IndexHeader>,
 }
 
 impl<H: SliceHasherBuilder, B: Book> BookHashTable<H, B> {
@@ -20,12 +36,15 @@ impl<H: SliceHasherBuilder, B: Book> BookHashTable<H, B> {
         hasher_builder: H,
         book: B,
         section_count: SectionIndex,
+        index_chunk_size: IndexChunkSize,
     ) -> Self {
         Self {
             hasher_builder,
             book,
             section_count,
             sections: BTreeMap::new(),
+            index_chunk_size,
+            indexes: BTreeMap::new(),
         }
     }
 
@@ -34,12 +53,16 @@ impl<H: SliceHasherBuilder, B: Book> BookHashTable<H, B> {
         book: B,
         section_count: SectionIndex,
         sections: impl Iterator<Item = (SectionIndex, SectionHeader)>,
+        index_chunk_size: IndexChunkSize,
+        indexes: impl Iterator<Item = (IndexKey, IndexHeader)>,
     ) -> io::Result<Self> {
         Ok(Self {
             hasher_builder,
             book,
             section_count,
             sections: sections.collect(),
+            index_chunk_size,
+            indexes: indexes.collect(),
         })
     }
 
@@ -48,10 +71,12 @@ impl<H: SliceHasherBuilder, B: Book> BookHashTable<H, B> {
         callback: impl FnOnce(
             &B,
             &mut dyn Iterator<Item = (SectionIndex, &SectionHeader)>,
+            &mut dyn Iterator<Item = (IndexKey, &IndexHeader)>,
         ) -> T,
     ) -> io::Result<T> {
         let mut sections = self.sections.iter().map(|(k, v)| (*k, v));
-        Ok(callback(&self.book, &mut sections))
+        let mut indexes = self.indexes.iter().map(|(k, v)| (*k, v));
+        Ok(callback(&self.book, &mut sections, &mut indexes))
     }
 }
 
@@ -60,11 +85,27 @@ impl<H: SliceHasherBuilder, B: Book> HashTable for BookHashTable<H, B> {
         let mut hasher = self.hasher_builder.build();
         hasher.update(key);
         let hash = hasher.finalize();
+
         let section_index = hash % self.section_count;
+        let bloom_index = (hash / self.section_count) as u64 % 64;
+        let bloom_bit = 1u64 << bloom_index;
+
         let mut section = self.book.section(section_index);
         let section_header = self.sections.entry(section_index).or_insert(SectionHeader {
             end_offset: 0,
         });
+
+        let index_chunk = (section_header.end_offset / self.index_chunk_size as u64) as IndexChunk;
+        let index_key = IndexKey {
+            section_index,
+            index_chunk,
+        };
+
+        let index_header = self.indexes.entry(index_key).or_insert(IndexHeader {
+            bloom_filter: 0,
+            first_entry_offset: section_header.end_offset,
+        });
+
         section.seek(SeekFrom::Start(section_header.end_offset))?;
 
         let key_size = key.len() as u32;
@@ -76,6 +117,9 @@ impl<H: SliceHasherBuilder, B: Book> HashTable for BookHashTable<H, B> {
     
         let new_end = section.stream_position()?;
         section_header.end_offset = new_end;
+
+        index_header.bloom_filter |= bloom_bit;
+
         Ok(())
     }
 
@@ -91,25 +135,41 @@ impl<H: SliceHasherBuilder, B: Book> HashTable for BookHashTable<H, B> {
                 };
                 Some(section_index)
             },
-            HashTableScanFilter::Hash(hash) => {
-                let section_index = hash % self.section_count;
-                Some(section_index)
+        };
+        let bloom_query = match filter {
+            HashTableScanFilter::Key(key) => {
+                let mut hasher = self.hasher_builder.build();
+                hasher.update(key);
+                let hash = hasher.finalize();
+                let bloom_index = (hash / self.section_count) as u64 % 64;
+                Some(1u64 << bloom_index)
             },
+            _ => None,
         };
         let section_scanners = match section_index {
             Some(index) => {
                 match self.sections.get(&index) {
                     Some(sh) => SectionScannerIterator::Single(SectionScanner {
                         section: self.book.section(index),
+                        section_index: index,
                         section_end: sh.end_offset,
+                        bloom_query,
+                        index_chunk: None,
+                        index_chunk_size: self.index_chunk_size,
+                        index_headers: &self.indexes,
                     }),
                     None => SectionScannerIterator::None,
                 }
             },
-            None => SectionScannerIterator::Many(self.sections.iter().map(|(&section_index, section_header)| {
+            None => SectionScannerIterator::Many(self.sections.iter().map(move |(&section_index, section_header)| {
                 SectionScanner {
                     section: self.book.section(section_index),
+                    section_index,
                     section_end: section_header.end_offset,
+                    bloom_query,
+                    index_chunk: None,
+                    index_chunk_size: self.index_chunk_size,
+                    index_headers: &self.indexes,
                 }
             })),
         };
@@ -119,23 +179,21 @@ impl<H: SliceHasherBuilder, B: Book> HashTable for BookHashTable<H, B> {
         };
         Ok(FilterScanner {
             filter,
-            hasher_builder: &self.hasher_builder,
             key_buffer: [0u8; 256],
             scanner: multi_scanner,
         })
     }
 }
 
-struct FilterScanner<'key, Scanner, H> {
+struct FilterScanner<'key, Scanner> {
     filter: HashTableScanFilter<'key>,
-    hasher_builder: H,
     key_buffer: [u8; 256],
     scanner: Scanner,
 }
 
-impl<'key, Scanner: HashTableScanner, H: SliceHasherBuilder> HashTableScanner for FilterScanner<'key, Scanner, H> {
-    fn next(&mut self) -> io::Result<Option<impl HashTableEntry + use<'key, Scanner, H>>> {
-        loop {
+impl<'key, Scanner: HashTableScanner> HashTableScanner for FilterScanner<'key, Scanner> {
+    fn next(&mut self) -> io::Result<Option<impl HashTableEntry + use<'key, Scanner>>> {
+        'entry_loop: loop {
             let mut entry = match self.scanner.next()? {
                 Some(e) => e,
                 None => return Ok(None),
@@ -145,45 +203,23 @@ impl<'key, Scanner: HashTableScanner, H: SliceHasherBuilder> HashTableScanner fo
                     let mut key_reader = entry.key()?;
                     let mut expected_key = *expected_key;
                     loop {
-                        let read_size = expected_key.len().min(self.key_buffer.len());
+                        let read_size = key_reader.read(&mut self.key_buffer)?;
                         if read_size == 0 {
-                            drop(key_reader);
-                            return Ok(Some(entry));
+                            if expected_key.is_empty() {
+                                drop(key_reader);
+                                return Ok(Some(entry));
+                            } else {
+                                continue 'entry_loop;
+                            }
                         }
-                        let read_size = key_reader.read(&mut self.key_buffer[..read_size])?;
-                        if read_size == 0 {
-                            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Unexpected EOF when reading key"));
+                        if read_size > expected_key.len() {
+                            continue 'entry_loop;
                         }
                         if &self.key_buffer[..read_size] != &expected_key[..read_size] {
-                            continue;
+                            continue 'entry_loop;
                         }
                         expected_key = &expected_key[read_size..];
                     }
-                },
-                HashTableScanFilter::Hash(expected_hash) => {
-                    let mut hasher = self.hasher_builder.build();
-                    let mut key_reader = entry.key()?;
-                    loop {
-                        let read_size = key_reader.read(&mut self.key_buffer)?;
-                        if read_size == 0 {
-                            break;
-                        }
-                        hasher.update(&self.key_buffer[..read_size]);
-                        
-                        // try compare
-                        if let Some(compare_result) = hasher.try_compare(*expected_hash) {
-                            if !compare_result {
-                                continue;
-                            }
-                            break;
-                        }
-                    }
-                    let key_hash = hasher.finalize();
-                    if &key_hash != expected_hash {
-                        continue;
-                    }
-                    drop(key_reader);
-                    return Ok(Some(entry));
                 },
                 HashTableScanFilter::All => {
                     return Ok(Some(entry));
@@ -193,13 +229,13 @@ impl<'key, Scanner: HashTableScanner, H: SliceHasherBuilder> HashTableScanner fo
     }
 }
 
-struct MultiSectionScanner<Section, I: Iterator<Item = SectionScanner<Section>>> {
+struct MultiSectionScanner<'a, Section, I: Iterator<Item = SectionScanner<'a, Section>>> {
     scanners: I,
-    current_scanner: Option<SectionScanner<Section>>,
+    current_scanner: Option<SectionScanner<'a, Section>>,
 }
 
-impl<Section: Read + Seek + Clone, I: Iterator<Item = SectionScanner<Section>>> HashTableScanner for MultiSectionScanner<Section, I> {
-    fn next(&mut self) -> io::Result<Option<impl HashTableEntry + use<Section, I>>> {
+impl<'a, Section: Read + Seek + Clone, I: Iterator<Item = SectionScanner<'a, Section>>> HashTableScanner for MultiSectionScanner<'a, Section, I> {
+    fn next(&mut self) -> io::Result<Option<impl HashTableEntry + use<'a, Section, I>>> {
         loop {
             if let Some(scanner) = &mut self.current_scanner {
                 if let Some(entry) = scanner.next()? {
@@ -216,14 +252,14 @@ impl<Section: Read + Seek + Clone, I: Iterator<Item = SectionScanner<Section>>> 
     }
 }
 
-enum SectionScannerIterator<Section, I: Iterator<Item = SectionScanner<Section>>> {
-    Single(SectionScanner<Section>),
+enum SectionScannerIterator<'a, Section, I: Iterator<Item = SectionScanner<'a, Section>>> {
+    Single(SectionScanner<'a, Section>),
     None,
     Many(I),
 }
 
-impl<Section, I: Iterator<Item = SectionScanner<Section>>> Iterator for SectionScannerIterator<Section, I> {
-    type Item = SectionScanner<Section>;
+impl<'a, Section, I: Iterator<Item = SectionScanner<'a, Section>>> Iterator for SectionScannerIterator<'a, Section, I> {
+    type Item = SectionScanner<'a, Section>;
 
     fn next(&mut self) -> Option<Self::Item> {
         match self {
@@ -241,9 +277,14 @@ impl<Section, I: Iterator<Item = SectionScanner<Section>>> Iterator for SectionS
     }
 }
 
-struct SectionScanner<Section> {
+struct SectionScanner<'a, Section> {
     section: Section,
+    section_index: SectionIndex,
     section_end: u64,
+    bloom_query: Option<u64>,
+    index_chunk: Option<(IndexKey, &'a IndexHeader)>,
+    index_chunk_size: IndexChunkSize,
+    index_headers: &'a BTreeMap<IndexKey, IndexHeader>,
 }
 
 struct ScannerEntry<Reader: Read + Seek + Clone> {
@@ -252,9 +293,39 @@ struct ScannerEntry<Reader: Read + Seek + Clone> {
     value_size: u32,
 }
 
-impl<Reader: Read + Seek + Clone> SectionScanner<Reader> {
+impl<'a, Reader: Read + Seek + Clone> SectionScanner<'a, Reader> {
     fn next(&mut self) -> io::Result<Option<ScannerEntry<Reader>>> {
-        match self.section.stream_position()?.cmp(&self.section_end) {
+        let mut position = self.section.stream_position()?;
+
+        if let Some(bloom_query) = self.bloom_query {
+            let index_chunk = (position / self.index_chunk_size as u64) as IndexChunk;
+            let index_key = IndexKey {
+                section_index: self.section_index,
+                index_chunk,
+            };
+            match &self.index_chunk {
+                Some((current_index_key, _)) if *current_index_key == index_key => {
+                    // TODO: in this case, we may skip next steps
+                },
+                _ => {
+                    self.index_chunk = self.index_headers.get(&index_key).map(|ih| (index_key, ih));
+                },
+            }
+            let Some((_, index_header)) = &self.index_chunk else {
+                return Ok(None);
+            };
+            if (index_header.bloom_filter & bloom_query) == 0 {
+                let next_index_header = self.index_headers.range((Bound::Excluded(index_key), Bound::Unbounded)).next();
+                let next_position = match next_index_header {
+                    Some((_, IndexHeader { first_entry_offset, .. })) => *first_entry_offset,
+                    None => self.section_end,
+                };
+                self.section.seek(SeekFrom::Start(next_position))?;
+                position = next_position;
+            }
+        }
+
+        match position.cmp(&self.section_end) {
             Ordering::Greater => {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "Section stream position exceeded section end"));
             },

@@ -1,11 +1,12 @@
 use std::{fs::{create_dir_all, rename}, io::{self, Write}, path::{Path, PathBuf}};
 
-use crate::{book::{self, SectionIndex, SectionPageIndex, pager::PagerBook}, hash_table::{self, HashTable, book::BookHashTable, prefix_hasher::PrefixHasherBuilder}, pager::{PageIndex, PageSize, fs::FilePager}};
+use crate::{book::{self, SectionIndex, SectionPageIndex, pager::PagerBook}, hash_table::{self, HashTable, book::{BookHashTable, IndexChunk, IndexChunkSize}, prefix_hasher::PrefixHasherBuilder}, pager::{PageIndex, PageSize, fs::FilePager}};
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct HashTableConfig {
     pub page_size: PageSize,
     pub section_count: SectionIndex,
+    pub index_chunk_size: IndexChunkSize,
 }
 
 impl Default for HashTableConfig {
@@ -13,6 +14,7 @@ impl Default for HashTableConfig {
         HashTableConfig {
             page_size: 4096,
             section_count: 1024,
+            index_chunk_size: 4096,
         }
     }
 }
@@ -31,11 +33,20 @@ struct PageHeader {
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
+struct IndexHeader {
+    section_index: SectionIndex,
+    index_chunk: IndexChunk,
+    bloom_filter: u64,
+    first_entry_offset: u64,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
 struct Header {
     #[serde(flatten)]
     config: HashTableConfig,
     sections: Vec<SectionHeader>,
     pages: Vec<PageHeader>,
+    indexes: Vec<IndexHeader>,
 }
 
 type THashTable = BookHashTable<PrefixHasherBuilder, PagerBook<FilePager>>;
@@ -77,6 +88,7 @@ impl ManagedHashTable {
                 config,
                 sections: Vec::new(),
                 pages: Vec::new(),
+                indexes: Vec::new(),
             };
 
             serde_json::to_writer_pretty(&header_file, &header)
@@ -112,6 +124,14 @@ impl ManagedHashTable {
             header.sections.iter().map(|sh| (sh.index, hash_table::book::SectionHeader {
                 end_offset: sh.end_offset,
             })),
+            header.config.index_chunk_size,
+            header.indexes.iter().map(|ih| (hash_table::book::IndexKey {
+                section_index: ih.section_index,
+                index_chunk: ih.index_chunk,
+            }, hash_table::book::IndexHeader {
+                bloom_filter: ih.bloom_filter,
+                first_entry_offset: ih.first_entry_offset,
+            })),
         )?;
 
         Ok(ManagedHashTable {
@@ -124,7 +144,7 @@ impl ManagedHashTable {
 
 impl ManagedHashTable {
     pub fn save(&mut self) -> io::Result<()> {
-        let (sections, pages) = self.hash_table.export(|book, sections| -> io::Result<_> {
+        let (sections, pages, indexes) = self.hash_table.export(|book, sections, indexes| -> io::Result<_> {
             let pages = book.export(|pager, pages| -> io::Result<_> {
                 pager.flush()?;
                 Ok(pages.map(|(page_key, page_header)| {
@@ -143,13 +163,23 @@ impl ManagedHashTable {
                 }
             }).collect();
 
-            Ok((sections, pages))
+            let indexes = indexes.map(|(index_key, index_header)| {
+                IndexHeader {
+                    section_index: index_key.section_index,
+                    index_chunk: index_key.index_chunk,
+                    bloom_filter: index_header.bloom_filter,
+                    first_entry_offset: index_header.first_entry_offset,
+                }
+            }).collect();
+
+            Ok((sections, pages, indexes))
         })??;
 
         let header = Header {
             config: self.config.clone(),
             sections,
             pages,
+            indexes,
         };
 
         let tmp_header_path = self.dir_path.join("header.json.tmp");

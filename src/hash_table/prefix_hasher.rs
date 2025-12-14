@@ -28,13 +28,6 @@ impl SliceHasher for PrefixHasher {
         self.offset += len;
     }
 
-    fn try_compare(&self, hash: Hash) -> Option<bool> {
-        if self.offset < HASH_BYTES {
-            return None
-        }
-        Some(self.buffer == hash.to_le_bytes())
-    }
-
     fn finalize(self) -> super::Hash {
         super::Hash::from_le_bytes(self.buffer)
     }
