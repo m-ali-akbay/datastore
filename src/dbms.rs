@@ -78,6 +78,10 @@ impl ManagedHashTable {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "Section count in metadata does not match the provided configuration"));
             }
 
+            if header.config.index_chunk_size != config.index_chunk_size {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "Index chunk size in metadata does not match the provided configuration"));
+            }
+
             header
         } else {
             let header_file = std::fs::OpenOptions::new()
