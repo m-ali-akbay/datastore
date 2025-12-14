@@ -1,5 +1,7 @@
 use crate::hash_table::{Hash, SliceHasher};
 
+use super::SliceHasherBuilder;
+
 const HASH_BYTES: usize = Hash::BITS as usize / 8;
 
 pub struct PrefixHasher {
@@ -26,6 +28,13 @@ impl SliceHasher for PrefixHasher {
         self.offset += len;
     }
 
+    fn try_compare(&self, hash: Hash) -> Option<bool> {
+        if self.offset < HASH_BYTES {
+            return None
+        }
+        Some(self.buffer == hash.to_le_bytes())
+    }
+
     fn finalize(self) -> super::Hash {
         super::Hash::from_le_bytes(self.buffer)
     }
@@ -33,7 +42,7 @@ impl SliceHasher for PrefixHasher {
 
 pub struct PrefixHasherBuilder;
 
-impl super::SliceHasherBuilder for PrefixHasherBuilder {
+impl SliceHasherBuilder for PrefixHasherBuilder {
     type Hasher = PrefixHasher;
 
     fn build(&self) -> Self::Hasher {

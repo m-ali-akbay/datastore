@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, io::{self, Read, Seek, Write}, sync::{Arc, RwLock}};
+use std::{collections::BTreeMap, io::{self, Read, Seek, Write}, sync::{Arc, RwLock, RwLockReadGuard}};
 
 use crate::pager::{Page, PageIndex, PageSize, Pager};
 
@@ -20,6 +20,14 @@ impl MemoryPager {
                 pages: RwLock::new(BTreeMap::new()),
             }),
         }
+    }
+
+    pub fn export<T>(&self, callback: impl FnOnce(&mut dyn Iterator<Item = (PageIndex, RwLockReadGuard<Box<[u8]>>)>) -> T) -> io::Result<T> {
+        let pages = self.inner.pages.read().map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "Poisoned lock"))?;
+        let pages = pages.iter()
+            .map(|(index, page)| page.read().map(|page|(*index, page)).map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "Poisoned lock")));
+        let pages: Vec<_> = pages.collect::<io::Result<_>>()?;
+        Ok(callback(&mut pages.into_iter()))
     }
 }
 

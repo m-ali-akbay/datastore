@@ -1,6 +1,6 @@
 use std::{io::Read, process};
 
-use datastore::{dbms::{HashTableConfig, ManagedHashTable}, hash_table::{HashTable, HashTableEntry, HashTableScanner}};
+use datastore::{dbms::{HashTableConfig, ManagedHashTable}, hash_table::{HashTable, HashTableEntry, HashTableScanFilter, HashTableScanner}};
 
 pub fn main() {
     let mut config: HashTableConfig = Default::default();
@@ -28,8 +28,11 @@ pub fn main() {
             process::exit(1);
         }
         println!("Inserted key-value pair: {:?} -> {:?}", key, value);
-    } else if args.len() == 2 {
-        let mut scanner = match hash_table.scan_key(args[1].as_bytes()) {
+    } else if args.len() == 2 || args.len() == 1 {
+        let mut scanner = match hash_table.scan(match args.get(1) {
+            Some(key) => HashTableScanFilter::Key(key.as_bytes()),
+            None => HashTableScanFilter::All,
+        }) {
             Ok(it) => it,
             Err(e) => {
                 eprintln!("Failed to create iterator: {}", e);
@@ -86,60 +89,6 @@ pub fn main() {
         }
         if !found_any {
             println!("No entries found.");
-        }
-    } else if args.len() == 1 {
-        let mut scanner = match hash_table.scan_all() {
-            Ok(it) => it,
-            Err(e) => {
-                eprintln!("Failed to create iterator: {}", e);
-                process::exit(1);
-            }
-        };
-
-        let mut key_buf = Vec::new();
-        let mut value_buf = Vec::new();
-        loop {
-            let mut entry = match scanner.next() {
-                Ok(Some(entry)) => entry,
-                Ok(None) => break,
-                Err(e) => {
-                    eprintln!("Scanner error: {}", e);
-                    process::exit(1);
-                },
-            };
-            let key = {
-                let mut key_reader = match entry.key() {
-                    Ok(r) => r,
-                    Err(e) => {
-                        eprintln!("Failed to read key: {}", e);
-                        process::exit(1);
-                    }
-                };
-                
-                key_buf.clear();
-                if let Err(e) = key_reader.read_to_end(&mut key_buf) {
-                    eprintln!("Failed to read key: {}", e);
-                    process::exit(1);
-                }
-                &key_buf[..]
-            };
-            let value = {
-                let mut value_reader = match entry.value() {
-                    Ok(r) => r,
-                    Err(e) => {
-                        eprintln!("Failed to read value: {}", e);
-                        process::exit(1);
-                    }
-                };
-
-                value_buf.clear();
-                if let Err(e) = value_reader.read_to_end(&mut value_buf) {
-                    eprintln!("Failed to read value: {}", e);
-                    process::exit(1);
-                }
-                &value_buf[..]
-            };
-            println!("Key: {:?}, Value: {:?}", String::from_utf8_lossy(&key), String::from_utf8_lossy(&value));
         }
     } else {
         println!("Usage:");

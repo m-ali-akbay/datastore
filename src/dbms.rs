@@ -174,15 +174,7 @@ impl HashTable for ManagedHashTable {
         self.hash_table.insert(key, value)
     }
 
-    fn scan_key(&self, key: &[u8]) -> io::Result<impl hash_table::HashTableScanner> {
-        self.hash_table.scan_key(key)
-    }
-
-    fn scan_hash(&self, hash: hash_table::Hash) -> io::Result<impl hash_table::HashTableScanner> {
-        self.hash_table.scan_hash(hash)
-    }
-
-    fn scan_all(&self) -> io::Result<impl hash_table::HashTableScanner> {
-        self.hash_table.scan_all()
+    fn scan(&self, filter: hash_table::HashTableScanFilter) -> io::Result<impl hash_table::HashTableScanner> {
+        self.hash_table.scan(filter)
     }
 }
