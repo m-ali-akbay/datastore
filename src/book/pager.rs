@@ -8,82 +8,51 @@ pub struct PageKey {
     pub section_page_index: SectionPageIndex,
 }
 
+#[derive(Clone)]
 pub struct PageHeader {
     pub pager_page_index: PageIndex,
 }
 
-struct Inner {
-    pages: BTreeMap<PageKey, PageHeader>,
+pub trait PageRegistry {
+    fn try_resolve_page(&self, key: &PageKey) -> io::Result<Option<PageHeader>>;
+    fn resolve_page(&self, key: &PageKey) -> io::Result<PageHeader>;
+}
+
+pub type PagerBookMemoryHeader = Arc<RwLock<BTreeMap<PageKey, PageHeader>>>;
+
+impl PageRegistry for PagerBookMemoryHeader {
+    fn try_resolve_page(&self, key: &PageKey) -> io::Result<Option<PageHeader>> {
+        let lock = self.read().map_err(|_| io::Error::new(io::ErrorKind::Other, "Lock poisoned"))?;
+        Ok(lock.get(key).cloned())
+    }
+
+    fn resolve_page(&self, key: &PageKey) -> io::Result<PageHeader> {
+        if let Some(page_header) = self.try_resolve_page(key)? {
+            return Ok(page_header);
+        }
+        let mut lock = self.write().map_err(|_| io::Error::new(io::ErrorKind::Other, "Lock poisoned"))?;
+        let pager_page_index = lock.len() as PageIndex;
+        Ok(lock.entry(*key).or_insert_with(|| PageHeader { pager_page_index }).clone())
+    }
 }
 
 #[derive(Clone)]
-pub struct PagerBook<Pager> {
+pub struct PagerBook<Pager, Registry> {
     pager: Pager,
-    inner: Arc<RwLock<Inner>>,
+    registry: Registry,
 }
 
-impl<P: Pager> PagerBook<P> {
-    pub fn new(pager: P) -> Self {
+impl<P: Pager, R: PageRegistry> PagerBook<P, R> {
+    pub fn new(pager: P, registry: R) -> Self {
         Self {
             pager,
-            inner: Arc::new(RwLock::new(Inner {
-                pages: BTreeMap::new(),
-            })),
+            registry,
         }
-    }
-
-    pub fn load(
-        pager: P,
-        pages: impl Iterator<Item = (PageKey, PageHeader)>,
-    ) -> io::Result<Self> {
-        let pages: BTreeMap<PageKey, PageHeader> = pages.collect();
-        
-        // Validate that pager_page_index starts at 0 and has no gaps
-        let mut indices: Vec<PageIndex> = pages.values()
-            .map(|h| h.pager_page_index)
-            .collect();
-        indices.sort_unstable();
-        
-        if !indices.is_empty() {
-            if indices[0] != 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Page indices must start at 0"
-                ));
-            }
-            for i in 1..indices.len() {
-                if indices[i] != indices[i - 1] + 1 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "Page indices must be contiguous"
-                    ));
-                }
-            }
-        }
-        
-        Ok(Self {
-            pager,
-            inner: Arc::new(RwLock::new(Inner {
-                pages,
-            })),
-        })
-    }
-
-    pub fn export<T>(
-        &self,
-        callback: impl FnOnce(
-            &P,
-            &mut dyn Iterator<Item = (PageKey, &PageHeader)>,
-        ) -> T,
-    ) -> io::Result<T> {
-        let inner = self.inner.read().map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "Poisoned lock"))?;
-        let mut pages = inner.pages.iter().map(|(k, v)| (*k, v));
-        Ok(callback(&self.pager, &mut pages))
     }
 }
 
-impl<P: Pager + Clone> Book for PagerBook<P> {
-    type Section = PagerBookSection<P>;
+impl<P: Pager + Clone, R: PageRegistry + Clone> Book for PagerBook<P, R> {
+    type Section = PagerBookSection<P, R>;
 
     fn section(&self, section_index: SectionIndex) -> Self::Section {
         PagerBookSection {
@@ -96,20 +65,20 @@ impl<P: Pager + Clone> Book for PagerBook<P> {
 }
 
 #[derive(Clone)]
-pub struct PagerBookSection<P: Pager> {
-    book: PagerBook<P>,
+pub struct PagerBookSection<P: Pager, R: PageRegistry> {
+    book: PagerBook<P, R>,
     section_index: SectionIndex,
     current_page: Option<(P::Page, SectionPageIndex)>,
     section_offset: u64,
 }
 
-impl<P: Pager + Clone> Section for PagerBookSection<P> {
+impl<P: Pager + Clone, R: PageRegistry + Clone> Section for PagerBookSection<P, R> {
     fn index(&self) -> SectionIndex {
         self.section_index
     }
 }
 
-impl<P: Pager> PagerBookSection<P> {
+impl<P: Pager, R: PageRegistry> PagerBookSection<P, R> {
     fn try_fetch_current_page(&mut self) -> io::Result<()> {
         let section_page_index = (self.section_offset / self.book.pager.page_size() as u64) as SectionPageIndex;
         if let Some((_, current_section_page_index)) = &self.current_page {
@@ -118,12 +87,11 @@ impl<P: Pager> PagerBookSection<P> {
             }
             self.current_page = None;
         }
-        let inner = self.book.inner.read().map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "Poisoned lock"))?;
         let page_key = PageKey {
             section_index: self.section_index,
             section_page_index,
         };
-        if let Some(page_header) = inner.pages.get(&page_key) {
+        if let Some(page_header) = self.book.registry.try_resolve_page(&page_key)? {
             let page = self.book.pager.page(page_header.pager_page_index)?;
             self.current_page = Some((page, section_page_index));
         }
@@ -142,20 +110,18 @@ impl<P: Pager> PagerBookSection<P> {
             return Ok(page);
         }
         let section_page_index = (*section_offset / book.pager.page_size() as u64) as SectionPageIndex;
-        let mut inner = book.inner.write().map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "Poisoned lock"))?;
         let page_key = PageKey {
             section_index: *section_index,
             section_page_index,
         };
-        let pager_page_index = inner.pages.len() as PageIndex;
+        let PageHeader { pager_page_index } = book.registry.resolve_page(&page_key)?;
         let page = book.pager.page(pager_page_index)?;
-        inner.pages.insert(page_key, PageHeader { pager_page_index });
         *current_page = Some((page, section_page_index));
         Ok(&mut current_page.as_mut().unwrap().0)
     }
 }
 
-impl<P: Pager> Read for PagerBookSection<P> {
+impl<P: Pager, R: PageRegistry> Read for PagerBookSection<P, R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let page_size = self.book.pager.page_size() as u64;
         let page_offset = self.section_offset % page_size;
@@ -173,7 +139,7 @@ impl<P: Pager> Read for PagerBookSection<P> {
     }
 }
 
-impl<P: Pager> Write for PagerBookSection<P> {
+impl<P: Pager, H: PageRegistry> Write for PagerBookSection<P, H> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let page_size = self.book.pager.page_size() as u64;
         let page_offset = self.section_offset % page_size;
@@ -194,7 +160,7 @@ impl<P: Pager> Write for PagerBookSection<P> {
     }
 }
 
-impl<P: Pager> Seek for PagerBookSection<P> {
+impl<P: Pager, H: PageRegistry> Seek for PagerBookSection<P, H> {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         let new_offset = match pos {
             SeekFrom::Start(offset) => offset,
@@ -238,8 +204,8 @@ mod tests {
     use crate::pager::{memory::MemoryPager, PageSize};
     use std::io::{Read, Seek, SeekFrom, Write};
 
-    fn create_test_book(page_size: PageSize) -> PagerBook<MemoryPager> {
-        PagerBook::new(MemoryPager::new(page_size))
+    fn create_test_book(page_size: PageSize) -> PagerBook<MemoryPager, PagerBookMemoryHeader> {
+        PagerBook::new(MemoryPager::new(page_size), Arc::new(RwLock::new(BTreeMap::new())))
     }
 
     #[test]
@@ -366,25 +332,6 @@ mod tests {
     }
 
     #[test]
-    fn test_load_and_export() -> io::Result<()> {
-        let pager = MemoryPager::new(1024);
-        let pages = vec![
-            (PageKey { section_index: 0, section_page_index: 0 }, PageHeader { pager_page_index: 0 }),
-            (PageKey { section_index: 1, section_page_index: 0 }, PageHeader { pager_page_index: 1 }),
-        ];
-
-        let book = PagerBook::load(pager, pages.into_iter())?;
-        let exported = book.export(|_, iter| {
-            iter.map(|(k, h)| (k, h.pager_page_index)).collect::<Vec<_>>()
-        })?;
-
-        assert_eq!(exported.len(), 2);
-        assert_eq!(exported[0].0.section_index, 0);
-        assert_eq!(exported[1].0.section_index, 1);
-        Ok(())
-    }
-
-    #[test]
     fn test_seek_errors() -> io::Result<()> {
         let book = create_test_book(1024);
         let mut section = book.section(0);
@@ -431,21 +378,6 @@ mod tests {
 
                 let mut section = book.section(section_index as SectionIndex);
                 section.write_all(&data)?;
-
-                {
-                    // Debug output
-
-                    println!("Written {} bytes to section {}", size, section_index);
-                    book.export(|pager, pages| -> io::Result<()> {
-                        for (page_key, page) in pages {
-                            let mut data = vec![0u8; pager.page_size() as usize];
-                            let mut page = pager.page(page.pager_page_index)?;
-                            page.read_exact(&mut data)?;
-                            println!("Section: {}, SecPage: {}, Data: {:?}", page_key.section_index, page_key.section_page_index, data);
-                        }
-                        Ok(())
-                    })??;
-                }
             }
         }
 

@@ -1,11 +1,17 @@
-use std::{cmp::Ordering, collections::BTreeMap, io::{self, Read, Seek, SeekFrom, Write}, mem::replace, ops::Bound};
+use std::{cmp::Ordering, io::{self, Read, Seek, SeekFrom, Write}, mem::replace};
 
 use crate::{book::{Book, SectionIndex}, hash_table::{HashTable, HashTableEntry, HashTableScanner, SliceHasher, SliceHasherBuilder}};
 
 use super::HashTableScanFilter;
 
+#[derive(Clone)]
 pub struct SectionHeader {
     pub end_offset: u64,
+}
+
+pub trait SectionRegistry {
+    fn resolve_section(&self, section_index: SectionIndex) -> io::Result<SectionHeader>;
+    fn update_section_end_offset(&mut self, section_index: SectionIndex, end_offset: u64) -> io::Result<()>;
 }
 
 pub type IndexChunk = u32;
@@ -17,70 +23,48 @@ pub struct IndexKey {
     pub index_chunk: IndexChunk,
 }
 
+#[derive(Clone, Copy, Debug)]
 pub struct IndexHeader {
     pub bloom_filter: u64,
     pub first_entry_offset: u64,
 }
 
-pub struct BookHashTable<H, B> {
+pub trait IndexRegistry {
+    fn try_resolve_index(&self, index_key: &IndexKey) -> io::Result<Option<IndexHeader>>;
+    fn try_resolve_next_index(&self, index_key: &IndexKey) -> io::Result<Option<IndexHeader>>;
+    fn update_index_bloom_filter(&mut self, index_key: &IndexKey, entry_offset: u64, bloom_bit: u64) -> io::Result<()>;
+}
+
+pub struct BookHashTable<H, B, SR, IR> {
     hasher_builder: H,
     book: B,
     section_count: SectionIndex,
-    sections: BTreeMap<SectionIndex, SectionHeader>,
+    section_registry: SR,
     index_chunk_size: IndexChunkSize,
-    indexes: BTreeMap<IndexKey, IndexHeader>,
+    index_registry: IR,
 }
 
-impl<H: SliceHasherBuilder, B: Book> BookHashTable<H, B> {
+impl<H: SliceHasherBuilder, B: Book, SR: SectionRegistry, IR: IndexRegistry> BookHashTable<H, B, SR, IR> {
     pub fn new(
         hasher_builder: H,
         book: B,
         section_count: SectionIndex,
+        section_registry: SR,
         index_chunk_size: IndexChunkSize,
+        index_registry: IR,
     ) -> Self {
         Self {
             hasher_builder,
             book,
             section_count,
-            sections: BTreeMap::new(),
+            section_registry,
             index_chunk_size,
-            indexes: BTreeMap::new(),
+            index_registry,
         }
-    }
-
-    pub fn load(
-        hasher_builder: H,
-        book: B,
-        section_count: SectionIndex,
-        sections: impl Iterator<Item = (SectionIndex, SectionHeader)>,
-        index_chunk_size: IndexChunkSize,
-        indexes: impl Iterator<Item = (IndexKey, IndexHeader)>,
-    ) -> io::Result<Self> {
-        Ok(Self {
-            hasher_builder,
-            book,
-            section_count,
-            sections: sections.collect(),
-            index_chunk_size,
-            indexes: indexes.collect(),
-        })
-    }
-
-    pub fn export<T>(
-        &self,
-        callback: impl FnOnce(
-            &B,
-            &mut dyn Iterator<Item = (SectionIndex, &SectionHeader)>,
-            &mut dyn Iterator<Item = (IndexKey, &IndexHeader)>,
-        ) -> T,
-    ) -> io::Result<T> {
-        let mut sections = self.sections.iter().map(|(k, v)| (*k, v));
-        let mut indexes = self.indexes.iter().map(|(k, v)| (*k, v));
-        Ok(callback(&self.book, &mut sections, &mut indexes))
     }
 }
 
-impl<H: SliceHasherBuilder, B: Book> HashTable for BookHashTable<H, B> {
+impl<H: SliceHasherBuilder, B: Book, SR: SectionRegistry, IR: IndexRegistry + Clone> HashTable for BookHashTable<H, B, SR, IR> {
     fn insert(&mut self, key: &[u8], value: &[u8]) -> io::Result<()> {
         let mut hasher = self.hasher_builder.build();
         hasher.update(key);
@@ -91,9 +75,7 @@ impl<H: SliceHasherBuilder, B: Book> HashTable for BookHashTable<H, B> {
         let bloom_bit = 1u64 << bloom_index;
 
         let mut section = self.book.section(section_index);
-        let section_header = self.sections.entry(section_index).or_insert(SectionHeader {
-            end_offset: 0,
-        });
+        let section_header = self.section_registry.resolve_section(section_index)?;
 
         let index_chunk = (section_header.end_offset / self.index_chunk_size as u64) as IndexChunk;
         let index_key = IndexKey {
@@ -101,12 +83,8 @@ impl<H: SliceHasherBuilder, B: Book> HashTable for BookHashTable<H, B> {
             index_chunk,
         };
 
-        let index_header = self.indexes.entry(index_key).or_insert(IndexHeader {
-            bloom_filter: 0,
-            first_entry_offset: section_header.end_offset,
-        });
-
-        section.seek(SeekFrom::Start(section_header.end_offset))?;
+        let entry_offset = section_header.end_offset;
+        section.seek(SeekFrom::Start(entry_offset))?;
 
         let key_size = key.len() as u32;
         let value_size = value.len() as u32;
@@ -116,9 +94,9 @@ impl<H: SliceHasherBuilder, B: Book> HashTable for BookHashTable<H, B> {
         section.write_all(value)?;
     
         let new_end = section.stream_position()?;
-        section_header.end_offset = new_end;
+        self.section_registry.update_section_end_offset(section_index, new_end)?;
 
-        index_header.bloom_filter |= bloom_bit;
+        self.index_registry.update_index_bloom_filter(&index_key, entry_offset, bloom_bit)?;
 
         Ok(())
     }
@@ -148,30 +126,38 @@ impl<H: SliceHasherBuilder, B: Book> HashTable for BookHashTable<H, B> {
         };
         let section_scanners = match section_index {
             Some(index) => {
-                match self.sections.get(&index) {
-                    Some(sh) => SectionScannerIterator::Single(SectionScanner {
+                match self.section_registry.resolve_section(index)? {
+                    SectionHeader {
+                        end_offset
+                    } if end_offset > 0 => SectionScannerIterator::Single(SectionScanner {
                         section: self.book.section(index),
                         section_index: index,
-                        section_end: sh.end_offset,
+                        section_end: end_offset,
                         bloom_query,
                         index_chunk: None,
                         index_chunk_size: self.index_chunk_size,
-                        index_headers: &self.indexes,
+                        index_registry: self.index_registry.clone(),
                     }),
-                    None => SectionScannerIterator::None,
+                    _ => SectionScannerIterator::None,
                 }
             },
-            None => SectionScannerIterator::Many(self.sections.iter().map(move |(&section_index, section_header)| {
-                SectionScanner {
-                    section: self.book.section(section_index),
-                    section_index,
-                    section_end: section_header.end_offset,
-                    bloom_query,
-                    index_chunk: None,
-                    index_chunk_size: self.index_chunk_size,
-                    index_headers: &self.indexes,
-                }
-            })),
+            None => SectionScannerIterator::Many(
+                // TODO: optimize this by supporting iterating non-empty sections only
+                (0..self.section_count)
+                    .map(|section_index| (section_index, self.section_registry.resolve_section(section_index)))
+                    .map(move |(section_index, section_header)| -> io::Result<SectionScanner<B::Section, IR>> {
+                        let section_header = section_header?;
+                        Ok(SectionScanner {
+                            section: self.book.section(section_index),
+                            section_index,
+                            section_end: section_header.end_offset,
+                            bloom_query,
+                            index_chunk: None,
+                            index_chunk_size: self.index_chunk_size,
+                            index_registry: self.index_registry.clone(),
+                        })
+                    })
+            ),
         };
         let multi_scanner = MultiSectionScanner {
             scanners: section_scanners,
@@ -229,13 +215,13 @@ impl<'key, Scanner: HashTableScanner> HashTableScanner for FilterScanner<'key, S
     }
 }
 
-struct MultiSectionScanner<'a, Section, I: Iterator<Item = SectionScanner<'a, Section>>> {
+struct MultiSectionScanner<IR, Section, I: Iterator<Item = io::Result<SectionScanner<Section, IR>>>> {
     scanners: I,
-    current_scanner: Option<SectionScanner<'a, Section>>,
+    current_scanner: Option<SectionScanner<Section, IR>>,
 }
 
-impl<'a, Section: Read + Seek + Clone, I: Iterator<Item = SectionScanner<'a, Section>>> HashTableScanner for MultiSectionScanner<'a, Section, I> {
-    fn next(&mut self) -> io::Result<Option<impl HashTableEntry + use<'a, Section, I>>> {
+impl<IR: IndexRegistry + Clone, Section: Read + Seek + Clone, I: Iterator<Item = io::Result<SectionScanner<Section, IR>>>> HashTableScanner for MultiSectionScanner<IR, Section, I> {
+    fn next(&mut self) -> io::Result<Option<impl HashTableEntry + use<IR, Section, I>>> {
         loop {
             if let Some(scanner) = &mut self.current_scanner {
                 if let Some(entry) = scanner.next()? {
@@ -244,7 +230,7 @@ impl<'a, Section: Read + Seek + Clone, I: Iterator<Item = SectionScanner<'a, Sec
                 self.current_scanner = None;
             }
             if let Some(next_scanner) = self.scanners.next() {
-                self.current_scanner = Some(next_scanner);
+                self.current_scanner = Some(next_scanner?);
                 continue;
             }
             return Ok(None);
@@ -252,21 +238,21 @@ impl<'a, Section: Read + Seek + Clone, I: Iterator<Item = SectionScanner<'a, Sec
     }
 }
 
-enum SectionScannerIterator<'a, Section, I: Iterator<Item = SectionScanner<'a, Section>>> {
-    Single(SectionScanner<'a, Section>),
+enum SectionScannerIterator<Section, IR, I: Iterator<Item = io::Result<SectionScanner<Section, IR>>>> {
+    Single(SectionScanner<Section, IR>),
     None,
     Many(I),
 }
 
-impl<'a, Section, I: Iterator<Item = SectionScanner<'a, Section>>> Iterator for SectionScannerIterator<'a, Section, I> {
-    type Item = SectionScanner<'a, Section>;
+impl<IR, Section, I: Iterator<Item = io::Result<SectionScanner<Section, IR>>>> Iterator for SectionScannerIterator<Section, IR, I> {
+    type Item = io::Result<SectionScanner<Section, IR>>;
 
     fn next(&mut self) -> Option<Self::Item> {
         match self {
             SectionScannerIterator::Single(..) => {
                 let section_scanner = replace(self, SectionScannerIterator::None);
                 if let SectionScannerIterator::Single(section_scanner) = section_scanner {
-                    Some(section_scanner)
+                    Some(Ok(section_scanner))
                 } else {
                     None
                 }
@@ -277,14 +263,14 @@ impl<'a, Section, I: Iterator<Item = SectionScanner<'a, Section>>> Iterator for 
     }
 }
 
-struct SectionScanner<'a, Section> {
+struct SectionScanner<Section, IR> {
     section: Section,
     section_index: SectionIndex,
     section_end: u64,
     bloom_query: Option<u64>,
-    index_chunk: Option<(IndexKey, &'a IndexHeader)>,
+    index_chunk: Option<(IndexKey, IndexHeader)>,
     index_chunk_size: IndexChunkSize,
-    index_headers: &'a BTreeMap<IndexKey, IndexHeader>,
+    index_registry: IR,
 }
 
 struct ScannerEntry<Reader: Read + Seek + Clone> {
@@ -293,7 +279,7 @@ struct ScannerEntry<Reader: Read + Seek + Clone> {
     value_size: u32,
 }
 
-impl<'a, Reader: Read + Seek + Clone> SectionScanner<'a, Reader> {
+impl<Reader: Read + Seek + Clone, IR: IndexRegistry> SectionScanner<Reader, IR> {
     fn next(&mut self) -> io::Result<Option<ScannerEntry<Reader>>> {
         let mut position = self.section.stream_position()?;
 
@@ -308,19 +294,16 @@ impl<'a, Reader: Read + Seek + Clone> SectionScanner<'a, Reader> {
                     // TODO: in this case, we may skip next steps
                 },
                 _ => {
-                    self.index_chunk = self.index_headers.get(&index_key).map(|ih| (index_key, ih));
+                    self.index_chunk = self.index_registry.try_resolve_index(&index_key)?.map(|ih| (index_key, ih));
                 },
             }
             let Some((_, index_header)) = &self.index_chunk else {
                 return Ok(None);
             };
             if (index_header.bloom_filter & bloom_query) == 0 {
-                let next_index_header = self.index_headers.range((Bound::Excluded(index_key), Bound::Excluded(IndexKey {
-                    section_index: index_key.section_index + 1,
-                    index_chunk: 0,
-                }))).next();
+                let next_index_header = self.index_registry.try_resolve_next_index(&index_key)?;
                 let next_position = match next_index_header {
-                    Some((_, IndexHeader { first_entry_offset, .. })) => *first_entry_offset,
+                    Some(IndexHeader { first_entry_offset, .. }) => first_entry_offset,
                     None => self.section_end,
                 };
                 self.section.seek(SeekFrom::Start(next_position))?;
