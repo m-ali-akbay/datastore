@@ -38,9 +38,9 @@ impl FilePager {
         })
     }
 
-    pub fn flush(&self) -> io::Result<()> {
-        let mut resource = self.inner.resource.lock().map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "Poisoned lock"))?;
-        resource.file.flush()
+    pub fn sync(&self) -> io::Result<()> {
+        let resource = self.inner.resource.lock().map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "Poisoned lock"))?;
+        resource.file.sync_all()
     }
 }
 

@@ -96,8 +96,8 @@ pub fn main() {
         process::exit(1);
     }
 
-    if let Err(e) = hash_table.save() {
-        eprintln!("Failed to save hash table: {}", e);
+    if let Err(e) = hash_table.quick_sync() {
+        eprintln!("Failed to quick-sync hash table: {}", e);
         process::exit(1);
     }
 }

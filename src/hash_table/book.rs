@@ -4,7 +4,7 @@ use crate::{book::{Book, SectionIndex}, hash_table::{HashTable, HashTableEntry, 
 
 use super::HashTableScanFilter;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct SectionHeader {
     pub end_offset: u64,
 }
