@@ -1,13 +1,13 @@
 use core::slice;
 use std::{collections::{BTreeSet}, fs::File, io::{self, Read, Seek}, sync::{Arc, RwLock}};
 
-use crate::{book::SectionIndex, dbms::wal::{WALReader, WriteAheadLog}, hash_table::book::{SectionHeader, SectionRegistry}};
+use crate::{book::SectionIndex, dbms::wal::WriteAheadLog, hash_table::book::{SectionHeader, SectionRegistry}};
 
 pub struct ManagedSectionRegistry<WAL> {
     file: File,
     cache: Vec<SectionHeader>,
     hot: BTreeSet<SectionIndex>,
-    wal: WAL,
+    wal: Option<WAL>,
 }
 
 #[derive(Clone, Debug)]
@@ -63,7 +63,7 @@ fn write_section_header(writer: &mut impl io::Write, header: &SectionHeader) -> 
 }
 
 impl<WAL> ManagedSectionRegistry<WAL> {
-    fn apply(&mut self, event: SectionEvent) -> io::Result<()> {
+    pub fn apply(&mut self, event: SectionEvent) -> io::Result<()> {
         match event {
             SectionEvent::Updated(section_index, header) => {
                 if self.cache.len() <= section_index as usize {
@@ -76,7 +76,12 @@ impl<WAL> ManagedSectionRegistry<WAL> {
         Ok(())
     }
 
-    pub fn load(mut file: File, section_count: SectionIndex, mut old_wal: impl WALReader<Event=SectionEvent>, new_wal: WAL) -> io::Result<Self> {
+    pub fn with_wal(mut self, wal: WAL) -> Self {
+        self.wal = Some(wal);
+        self
+    }
+
+    pub fn load(mut file: File, section_count: SectionIndex) -> io::Result<Self> {
         let size = section_count as u64 * ENTRY_SIZE as u64;
         file.set_len(size)?;
 
@@ -84,11 +89,7 @@ impl<WAL> ManagedSectionRegistry<WAL> {
         let cache = (0..section_count)
             .map(|_| read_section_header(&mut file))
             .collect::<io::Result<Vec<_>>>()?;
-        let mut registry = Self { file, cache, hot: BTreeSet::new(), wal: new_wal };
-        while let Some(event) = old_wal.read_next()? {
-            registry.apply(event)?;
-        }
-        Ok(registry)
+        Ok(Self { file, cache, hot: BTreeSet::new(), wal: None })
     }
 
     pub fn save(&mut self) -> io::Result<()> {

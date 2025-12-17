@@ -1,14 +1,14 @@
 use core::slice;
 use std::{cmp::Ordering, collections::{BTreeMap, BTreeSet}, fs::File, io::{self, Read, Seek}, ops::Bound, sync::{Arc, RwLock}};
 
-use crate::{dbms::wal::{WALReader, WriteAheadLog}, hash_table::book::{IndexHeader, IndexKey, IndexRegistry}};
+use crate::{dbms::wal::WriteAheadLog, hash_table::book::{IndexHeader, IndexKey, IndexRegistry}};
 
 pub struct ManagedIndexRegistry<WAL> {
     file: File,
     cache: Vec<(IndexKey, IndexHeader)>,
     map: BTreeMap<IndexKey, usize>,
     hot: BTreeSet<usize>,
-    wal: WAL,
+    wal: Option<WAL>,
 }
 
 #[derive(Clone, Debug)]
@@ -105,7 +105,7 @@ fn write_index_entry(writer: &mut impl io::Write, key: &IndexKey, header: &Index
 }
 
 impl<WAL> ManagedIndexRegistry<WAL> {
-    fn apply(&mut self, event: IndexEvent) -> io::Result<()> {
+    pub fn apply(&mut self, event: IndexEvent) -> io::Result<()> {
         match event {
             IndexEvent::Updated(cache_idx, key, header) => {
                 match self.cache.len().cmp(&(cache_idx as usize)) {
@@ -120,7 +120,12 @@ impl<WAL> ManagedIndexRegistry<WAL> {
         Ok(())
     }
 
-    pub fn load(mut file: File, mut old_wal: impl WALReader<Event=IndexEvent>, new_wal: WAL) -> io::Result<Self> {
+    pub fn with_wal(mut self, wal: WAL) -> Self {
+        self.wal = Some(wal);
+        self
+    }
+
+    pub fn load(mut file: File) -> io::Result<Self> {
         let count = file.metadata()?.len() as usize / ENTRY_SIZE;
         file.seek(io::SeekFrom::Start(0))?;
         let cache = (0..count)
@@ -131,11 +136,7 @@ impl<WAL> ManagedIndexRegistry<WAL> {
             .enumerate()
             .map(|(i, (key, _))| (key.clone(), i))
             .collect();
-        let mut registry = Self { file, cache, map, hot: BTreeSet::new(), wal: new_wal };
-        while let Some(event) = old_wal.read_next()? {
-            registry.apply(event)?;
-        }
-        Ok(registry)
+        Ok(Self { file, cache, map, hot: BTreeSet::new(), wal: None })
     }
 
     pub fn save(&mut self) -> io::Result<()> {

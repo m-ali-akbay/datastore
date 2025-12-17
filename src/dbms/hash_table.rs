@@ -1,7 +1,7 @@
 use core::slice;
 use std::{fs::{self, create_dir_all}, io::{self}, path::Path, sync::{Arc, RwLock}};
 
-use crate::{dbms::{index_registry::IndexEvent, section_registry::SectionEvent, wal::{ConvertWAL, FileWAL, FileWALReader, FilterMapWALReader, SerializableEvent}}, pager::{PageSize, fs::FilePager}};
+use crate::{dbms::{index_registry::IndexEvent, section_registry::SectionEvent, wal::{ConvertWAL, FileWAL, FileWALReader, SerializableEvent, WALReader}}, pager::{PageSize, fs::FilePager}};
 use crate::hash_table::{self, HashTable, book::{BookHashTable, IndexChunkSize}, prefix_hasher::PrefixHasherBuilder};
 use crate::dbms::{index_registry::ManagedIndexRegistry, page_registry::{ManagedPageRegistry, PageEvent}, section_registry::ManagedSectionRegistry};
 use crate::book::{SectionIndex, pager::PagerBook};
@@ -147,6 +147,11 @@ type THashTable = BookHashTable<
     TIndexRegistry,
 >;
 
+/// ## Guarantees:
+/// - All operations are persisted on disk as soon as and only if `sync` is called.
+/// - Duration of `sync` is independent of size of entries BUT their count.
+/// - `scan`s using `HashTableScanFilter::Key` will iterate over entries in the order of inserts.
+/// - `insert` operations are O(1) on average, and duration depends on the size of the entry being inserted.
 pub struct ManagedHashTable {
     hash_table: THashTable,
     pager: TPager,
@@ -203,8 +208,6 @@ impl ManagedHashTable {
             .write(true)
             .create(true)
             .open(&wal_path)?;
-        // TODO: avoid cloning the file handle
-        let wal = FileWAL::load(wal_file.try_clone()?)?;
 
         let pages_path = dir_path.as_ref().join("pages.dat");
         let pages_file = fs::OpenOptions::new()
@@ -219,53 +222,47 @@ impl ManagedHashTable {
             .write(true)
             .create(true)
             .open(&dir_path.as_ref().join("pages.reg"))?;
-        let page_registry = Arc::new(RwLock::new(ManagedPageRegistry::load(
+        let mut page_registry = ManagedPageRegistry::load(
             page_registry_file,
-            // TODO: implement MUX WAL reader and writer
-            FilterMapWALReader::new(FileWALReader::new(wal_file.try_clone()?)?, |event| {
-                match event {
-                    HashTableEvent::PageEvent(page_event) => Some(page_event),
-                    _ => None,
-                }
-            }),
-            TPageRegistryWal::new(wal.clone()),
-        )?));
+        )?;
 
         let section_registry_file = fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .open(&dir_path.as_ref().join("sections.reg"))?;
-        let section_registry = Arc::new(RwLock::new(
-            ManagedSectionRegistry::load(
-                section_registry_file,
-                header.config.section_count,
-                FilterMapWALReader::new(FileWALReader::new(wal_file.try_clone()?)?, |event| {
-                    match event {
-                        HashTableEvent::SectionEvent(section_event) => Some(section_event),
-                        _ => None,
-                    }
-                }),
-                TSectionRegistryWal::new(wal.clone()),
-            )?
-        ));
+        let mut section_registry = ManagedSectionRegistry::load(
+            section_registry_file,
+            header.config.section_count,
+        )?;
 
         let index_registry_file = fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .open(&dir_path.as_ref().join("indexes.reg"))?;
+        let mut index_registry = ManagedIndexRegistry::load(
+            index_registry_file,
+        )?;
+
+        let mut wal_reader = FileWALReader::<HashTableEvent>::new(wal_file)?;
+        while let Some(event) = wal_reader.read_next()? {
+            match event {
+                HashTableEvent::PageEvent(page_event) => page_registry.apply(page_event)?,
+                HashTableEvent::SectionEvent(section_event) => section_registry.apply(section_event)?,
+                HashTableEvent::IndexEvent(index_event) => index_registry.apply(index_event)?,
+            }
+        }
+
+        let wal = FileWAL::load(wal_reader.into_file())?;
+        let page_registry = Arc::new(RwLock::new(
+            ManagedPageRegistry::with_wal(page_registry, ConvertWAL::new(wal.clone())),
+        ));
+        let section_registry = Arc::new(RwLock::new(
+            ManagedSectionRegistry::with_wal(section_registry, ConvertWAL::new(wal.clone())),
+        ));
         let index_registry = Arc::new(RwLock::new(
-            ManagedIndexRegistry::load(
-                index_registry_file,
-                FilterMapWALReader::new(FileWALReader::new(wal_file.try_clone()?)?, |event| {
-                    match event {
-                        HashTableEvent::IndexEvent(index_event) => Some(index_event),
-                        _ => None,
-                    }
-                }),
-                TIndexRegistryWal::new(wal.clone()),
-            )?
+            ManagedIndexRegistry::with_wal(index_registry, ConvertWAL::new(wal.clone())),
         ));
 
         let book = PagerBook::new(
@@ -298,7 +295,7 @@ impl ManagedHashTable {
 }
 
 impl ManagedHashTable {
-    pub fn quick_sync(&mut self) -> io::Result<()> {
+    pub fn sync(&mut self) -> io::Result<()> {
         self.pager.sync()?;
         self.wal.sync()?;
 
@@ -306,7 +303,7 @@ impl ManagedHashTable {
     }
 
     pub fn full_sync(&mut self) -> io::Result<()> {
-        self.quick_sync()?;
+        self.sync()?;
 
         // TODO: Acquire locks in a consistent order to avoid deadlocks
         let mut page_registry = self.page_registry.write().map_err(|_| io::Error::new(io::ErrorKind::Other, "Lock poisoned"))?;
@@ -317,7 +314,6 @@ impl ManagedHashTable {
         section_registry.save()?;
         index_registry.save()?;
 
-        // TODO: Keeping the file size unchanged would make it more optimal to append new events later on as no allocation is needed
         self.wal.clear()?;
 
         Ok(())

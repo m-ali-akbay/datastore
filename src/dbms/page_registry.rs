@@ -1,13 +1,13 @@
 use std::{cmp::Ordering, collections::BTreeMap, fs::File, io::{self, Read, Seek}, slice, sync::{Arc, RwLock}};
 
-use crate::{book::pager::{PageHeader, PageKey, PageRegistry}, dbms::wal::{WALReader, WriteAheadLog}, pager::PageIndex};
+use crate::{book::pager::{PageHeader, PageKey, PageRegistry}, dbms::wal::WriteAheadLog, pager::PageIndex};
 
 pub struct ManagedPageRegistry<WAL> {
     file: File,
     cache: Vec<PageKey>,
     map: BTreeMap<PageKey, PageIndex>,
     hot: Vec<(PageKey, PageIndex)>,
-    wal: WAL,
+    wal: Option<WAL>,
 }
 
 #[derive(Clone, Debug)]
@@ -66,7 +66,7 @@ fn write_page_key(writer: &mut impl io::Write, key: &PageKey) -> io::Result<()> 
 }
 
 impl<WAL> ManagedPageRegistry<WAL> {
-    fn apply(&mut self, event: PageEvent) -> io::Result<()> {
+    pub fn apply(&mut self, event: PageEvent) -> io::Result<()> {
         match event {
             PageEvent::Assigned(key, pager_page_index) => {
                 match self.cache.len().cmp(&(pager_page_index as usize)) {
@@ -81,7 +81,12 @@ impl<WAL> ManagedPageRegistry<WAL> {
         Ok(())
     }
 
-    pub fn load(mut file: File, mut old_wal: impl WALReader<Event=PageEvent>, new_wal: WAL) -> io::Result<Self> {
+    pub fn with_wal(mut self, wal: WAL) -> Self {
+        self.wal = Some(wal);
+        self
+    }
+
+    pub fn load(mut file: File) -> io::Result<Self> {
         let count = file.metadata()?.len() as usize / ENTRY_SIZE;
         file.seek(io::SeekFrom::Start(0))?;
         let cache = (0..count)
@@ -92,11 +97,7 @@ impl<WAL> ManagedPageRegistry<WAL> {
             .enumerate()
             .map(|(i, key)| (key.clone(), i as PageIndex))
             .collect();
-        let mut registry = Self { file, cache, map, hot: Vec::new(), wal: new_wal };
-        while let Some(event) = old_wal.read_next()? {
-            registry.apply(event)?;
-        }
-        Ok(registry)
+        Ok(Self { file, cache, map, hot: Vec::new(), wal: None })
     }
 
     pub fn save(&mut self) -> io::Result<()> {

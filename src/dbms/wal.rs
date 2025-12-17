@@ -6,6 +6,18 @@ pub trait WriteAheadLog {
     fn record(&self, event: Self::Event) -> io::Result<()>;
 }
 
+impl<WAL: WriteAheadLog> WriteAheadLog for Option<WAL> {
+    type Event = WAL::Event;
+
+    fn record(&self, event: Self::Event) -> io::Result<()> {
+        if let Some(wal) = self {
+            wal.record(event)
+        } else {
+            Ok(())
+        }
+    }
+}
+
 pub struct ConvertWAL<EventInto, WAL> {
     wal: WAL,
     _marker: PhantomData<EventInto>,
@@ -146,6 +158,10 @@ impl<Event> FileWALReader<Event>
             _marker: PhantomData,
         })
     }
+
+    pub fn into_file(self) -> File {
+        self.file
+    }
 }
 
 impl<Event> WALReader for FileWALReader<Event>
@@ -168,32 +184,5 @@ where
                 Ok(Some(event))
             },
         }
-    }
-}
-pub struct FilterMapWALReader<WAL, FilterMapper> {
-    wal: WAL,
-    mapper: FilterMapper,
-}
-
-impl<WAL, FilterMapper> FilterMapWALReader<WAL, FilterMapper> {
-    pub fn new(wal: WAL, mapper: FilterMapper) -> Self {
-        Self { wal, mapper }
-    }
-}
-
-impl<InEvent, OutEvent, WAL, FilterMapper> WALReader for FilterMapWALReader<WAL, FilterMapper>
-where
-    WAL: WALReader<Event = InEvent>,
-    FilterMapper: Fn(InEvent) -> Option<OutEvent>,
-{
-    type Event = OutEvent;
-
-    fn read_next(&mut self) -> io::Result<Option<OutEvent>> {
-        while let Some(event) = self.wal.read_next()? {
-            if let Some(mapped) = (self.mapper)(event) {
-                return Ok(Some(mapped));
-            }
-        }
-        Ok(None)
     }
 }
