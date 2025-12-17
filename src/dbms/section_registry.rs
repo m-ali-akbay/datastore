@@ -1,5 +1,5 @@
 use core::slice;
-use std::{collections::{BTreeSet}, fs::File, io::{self, Read, Seek}, sync::{Arc, RwLock}};
+use std::{collections::{BTreeSet}, fs::File, io::{self, Read, Seek}};
 
 use crate::{book::SectionIndex, dbms::wal::WriteAheadLog, hash_table::book::{SectionHeader, SectionRegistry}};
 
@@ -104,17 +104,15 @@ impl<WAL> ManagedSectionRegistry<WAL> {
     }
 }
 
-impl<WAL: WriteAheadLog<Event=SectionEvent>> SectionRegistry for Arc<RwLock<ManagedSectionRegistry<WAL>>> {
+impl<WAL: WriteAheadLog<Event=SectionEvent>> SectionRegistry for ManagedSectionRegistry<WAL> {
     fn resolve_section(&self, section_index: SectionIndex) -> io::Result<SectionHeader> {
-        let registry = self.read().map_err(|_| io::Error::new(io::ErrorKind::Other, "Lock poisoned"))?;
-        registry.cache.get(section_index as usize)
+        self.cache.get(section_index as usize)
             .cloned()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Section not found"))
     }
 
     fn update_section_end_offset(&mut self, section_index: SectionIndex, end_offset: u64) -> io::Result<()> {
-        let mut registry = self.write().map_err(|_| io::Error::new(io::ErrorKind::Other, "Lock poisoned"))?;
-        let event = if let Some(header) = registry.cache.get_mut(section_index as usize) {
+        let event = if let Some(header) = self.cache.get_mut(section_index as usize) {
             if header.end_offset >= end_offset {
                 return Ok(());
             }
@@ -124,7 +122,7 @@ impl<WAL: WriteAheadLog<Event=SectionEvent>> SectionRegistry for Arc<RwLock<Mana
         } else {
             return Err(io::Error::new(io::ErrorKind::NotFound, "Section not found"));
         };
-        registry.wal.record(event.clone())?;
-        registry.apply(event)
+        self.wal.record(event.clone())?;
+        self.apply(event)
     }
 }

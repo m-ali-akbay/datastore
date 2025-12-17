@@ -1,4 +1,4 @@
-use std::{fs::File, io::{self, Read, Seek, SeekFrom, Write}, sync::{Arc, Mutex}};
+use std::{fs::File, io::{self, Read, Seek, SeekFrom, Write}, sync::Mutex};
 
 use crate::pager::{Page, PageSize, Pager};
 
@@ -9,20 +9,15 @@ struct FilePagerResource {
     size: u64,
 }
 
-struct FilePagerInner {
+pub struct FilePager {
     page_size: PageSize,
     resource: Mutex<FilePagerResource>,
 }
 
 #[derive(Clone)]
-pub struct FilePager {
-    inner: Arc<FilePagerInner>,
-}
-
-#[derive(Clone)]
-pub struct FilePage {
+pub struct FilePage<'a> {
     index: PageIndex,
-    pager: FilePager,
+    pager: &'a FilePager,
     page_offset: u64,
     file_offset: u64,
 }
@@ -31,43 +26,41 @@ impl FilePager {
     pub fn new(file: File, page_size: PageSize) -> io::Result<Self> {
         let size = file.metadata()?.len();
         Ok(Self {
-            inner: Arc::new(FilePagerInner {
-                page_size,
-                resource: Mutex::new(FilePagerResource { file, size }),
-            }),
+            page_size,
+            resource: Mutex::new(FilePagerResource { file, size }),
         })
     }
 
     pub fn sync(&self) -> io::Result<()> {
-        let resource = self.inner.resource.lock().map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "Poisoned lock"))?;
+        let resource = self.resource.lock().map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "Poisoned lock"))?;
         resource.file.sync_all()
     }
 }
 
 impl Pager for FilePager {
-    type Page = FilePage;
+    type Page<'a> = FilePage<'a> where Self: 'a;
 
-    fn page(&self, page_index: PageIndex) -> io::Result<Self::Page> {
+    fn page<'a>(&'a self, page_index: PageIndex) -> io::Result<Self::Page<'a>> {
         Ok(FilePage {
             index: page_index,
-            pager: self.clone(),
+            pager: self,
             page_offset: 0,
             file_offset: (page_index as u64).checked_mul(self.page_size() as u64).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "File offset overflow"))?,
         })
     }
 
     fn page_size(&self) -> PageSize {
-        self.inner.page_size
+        self.page_size
     }
 }
 
-impl Page for FilePage {
+impl Page for FilePage<'_> {
     fn index(&self) -> PageIndex {
         self.index
     }
 }
 
-impl Read for FilePage {
+impl Read for FilePage<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let page_size = self.pager.page_size() as u64;
         if self.page_offset == page_size {
@@ -77,7 +70,7 @@ impl Read for FilePage {
         if max_read_size == 0 {
             return Ok(0);
         }
-        let mut resource = self.pager.inner.resource.lock().map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "Poisoned lock"))?;
+        let mut resource = self.pager.resource.lock().map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "Poisoned lock"))?;
         let read_size = if self.file_offset >= resource.size {
             buf[..max_read_size].fill(0);
             self.page_offset += max_read_size as u64;
@@ -93,14 +86,14 @@ impl Read for FilePage {
     }
 }
 
-impl Write for FilePage {
+impl Write for FilePage<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let page_size = self.pager.page_size() as u64;
         let max_write_size = (page_size - self.page_offset).min(buf.len() as u64) as usize;
         if max_write_size == 0 {
             return Ok(0);
         }
-        let mut resource = self.pager.inner.resource.lock().map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "Poisoned lock"))?;
+        let mut resource = self.pager.resource.lock().map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "Poisoned lock"))?;
         resource.file.seek(SeekFrom::Start(self.file_offset))?;
         let write_size = resource.file.write(&buf[..max_write_size])?;
         self.page_offset += write_size as u64;
@@ -112,12 +105,12 @@ impl Write for FilePage {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        let mut resource = self.pager.inner.resource.lock().map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "Poisoned lock"))?;
+        let mut resource = self.pager.resource.lock().map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "Poisoned lock"))?;
         resource.file.flush()
     }
 }
 
-impl Seek for FilePage {
+impl Seek for FilePage<'_> {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         let page_size = self.pager.page_size() as u64;
         let (anchor, offset, is_forward) = match pos {

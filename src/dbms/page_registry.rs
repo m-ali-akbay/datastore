@@ -1,4 +1,4 @@
-use std::{cmp::Ordering, collections::BTreeMap, fs::File, io::{self, Read, Seek}, slice, sync::{Arc, RwLock}};
+use std::{cmp::Ordering, collections::BTreeMap, fs::File, io::{self, Read, Seek}, slice};
 
 use crate::{book::pager::{PageHeader, PageKey, PageRegistry}, dbms::wal::WriteAheadLog, pager::PageIndex};
 
@@ -111,10 +111,9 @@ impl<WAL> ManagedPageRegistry<WAL> {
     }
 }
 
-impl<WAL: WriteAheadLog<Event=PageEvent>> PageRegistry for Arc<RwLock<ManagedPageRegistry<WAL>>> {
+impl<WAL: WriteAheadLog<Event=PageEvent>> PageRegistry for ManagedPageRegistry<WAL> {
     fn try_resolve_page(&self, key: &PageKey) -> io::Result<Option<PageHeader>> {
-        let lock = self.read().map_err(|_| io::Error::new(io::ErrorKind::Other, "Lock poisoned"))?;
-        if let Some(&pager_page_index) = lock.map.get(key) {
+        if let Some(&pager_page_index) = self.map.get(key) {
             Ok(Some(PageHeader {
                 pager_page_index,
             }))
@@ -123,20 +122,19 @@ impl<WAL: WriteAheadLog<Event=PageEvent>> PageRegistry for Arc<RwLock<ManagedPag
         }
     }
 
-    fn resolve_page(&self, key: &PageKey) -> io::Result<PageHeader> {
+    fn resolve_page(&mut self, key: &PageKey) -> io::Result<PageHeader> {
         if let Some(page_header) = self.try_resolve_page(key)? {
             return Ok(page_header);
         }
-        let mut lock = self.write().map_err(|_| io::Error::new(io::ErrorKind::Other, "Lock poisoned"))?;
-        if let Some(&pager_page_index) = lock.map.get(key) {
+        if let Some(&pager_page_index) = self.map.get(key) {
             return Ok(PageHeader {
                 pager_page_index,
             });
         }
-        let pager_page_index = lock.cache.len() as PageIndex;
+        let pager_page_index = self.cache.len() as PageIndex;
         let event = PageEvent::Assigned(key.clone(), pager_page_index);
-        lock.wal.record(event.clone())?;
-        lock.apply(event)?;
+        self.wal.record(event.clone())?;
+        self.apply(event)?;
         Ok(PageHeader {
             pager_page_index,
         })

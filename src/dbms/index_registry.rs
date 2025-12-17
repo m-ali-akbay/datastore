@@ -1,5 +1,5 @@
 use core::slice;
-use std::{cmp::Ordering, collections::{BTreeMap, BTreeSet}, fs::File, io::{self, Read, Seek}, ops::Bound, sync::{Arc, RwLock}};
+use std::{cmp::Ordering, collections::{BTreeMap, BTreeSet}, fs::File, io::{self, Read, Seek}, ops::Bound};
 
 use crate::{dbms::wal::WriteAheadLog, hash_table::book::{IndexHeader, IndexKey, IndexRegistry}};
 
@@ -152,11 +152,10 @@ impl<WAL> ManagedIndexRegistry<WAL> {
 }
 
 // TODO: make IndexKey and IndexHeader assigned types for further optimization on resolve methods
-impl<WAL: WriteAheadLog<Event=IndexEvent>> IndexRegistry for Arc<RwLock<ManagedIndexRegistry<WAL>>> {
+impl<WAL: WriteAheadLog<Event=IndexEvent>> IndexRegistry for ManagedIndexRegistry<WAL> {
     fn try_resolve_index(&self, index_key: &IndexKey) -> io::Result<Option<IndexHeader>> {
-        let lock = self.read().map_err(|_| io::Error::new(io::ErrorKind::Other, "Lock poisoned"))?;
-        if let Some(&index) = lock.map.get(index_key) {
-            let (_, header) = &lock.cache[index];
+        if let Some(&index) = self.map.get(index_key) {
+            let (_, header) = &self.cache[index];
             Ok(Some(header.clone()))
         } else {
             Ok(None)
@@ -164,22 +163,20 @@ impl<WAL: WriteAheadLog<Event=IndexEvent>> IndexRegistry for Arc<RwLock<ManagedI
     }
 
     fn try_resolve_next_index(&self, index_key: &IndexKey) -> io::Result<Option<IndexHeader>> {
-        let lock = self.read().map_err(|_| io::Error::new(io::ErrorKind::Other, "Lock poisoned"))?;
-        let Some(index) = lock.map.range((Bound::Excluded(index_key.clone()), Bound::Excluded(IndexKey { 
+        let Some(index) = self.map.range((Bound::Excluded(index_key.clone()), Bound::Excluded(IndexKey { 
             section_index: index_key.section_index + 1, 
             index_chunk: 0,
         })))
             .next() else {
             return Ok(None);
         };
-        let (_, header) = &lock.cache[*index.1];
+        let (_, header) = &self.cache[*index.1];
         Ok(Some(header.clone()))
     }
 
     fn update_index_bloom_filter(&mut self, index_key: &IndexKey, entry_offset: u64, bloom_bit: u64) -> io::Result<()> {
-        let mut lock = self.write().map_err(|_| io::Error::new(io::ErrorKind::Other, "Lock poisoned"))?;
-        let event = if let Some(&cache_idx) = lock.map.get(index_key) {
-            let header = &mut lock.cache[cache_idx].1;
+        let event = if let Some(&cache_idx) = self.map.get(index_key) {
+            let header = &mut self.cache[cache_idx].1;
             let old_bloom_filter = header.bloom_filter;
             let new_bloom_filter = old_bloom_filter | bloom_bit;
             if new_bloom_filter == old_bloom_filter {
@@ -189,15 +186,15 @@ impl<WAL: WriteAheadLog<Event=IndexEvent>> IndexRegistry for Arc<RwLock<ManagedI
             index_header.bloom_filter = new_bloom_filter;
             IndexEvent::Updated(cache_idx as u32, index_key.clone(), index_header)
         } else {
-            let cache_idx = lock.cache.len();
+            let cache_idx = self.cache.len();
             let index_header = IndexHeader {
                 bloom_filter: bloom_bit,
                 first_entry_offset: entry_offset,
             };
             IndexEvent::Updated(cache_idx as u32, index_key.clone(), index_header)
         };
-        lock.wal.record(event.clone())?;
-        lock.apply(event)?;
+        self.wal.record(event.clone())?;
+        self.apply(event)?;
         Ok(())
     }
 }

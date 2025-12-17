@@ -1,4 +1,4 @@
-use std::{cmp::min, collections::BTreeMap, io::{self, Read, Seek, SeekFrom, Write}, sync::{Arc, RwLock}};
+use std::{cmp::min, collections::BTreeMap, io::{self, Read, Seek, SeekFrom, Write}, sync::RwLock};
 
 use crate::{book::{Book, Section, SectionIndex, SectionPageIndex}, pager::{PageIndex, Pager}};
 
@@ -15,10 +15,10 @@ pub struct PageHeader {
 
 pub trait PageRegistry {
     fn try_resolve_page(&self, key: &PageKey) -> io::Result<Option<PageHeader>>;
-    fn resolve_page(&self, key: &PageKey) -> io::Result<PageHeader>;
+    fn resolve_page(&mut self, key: &PageKey) -> io::Result<PageHeader>;
 }
 
-pub type PagerBookMemoryHeader = Arc<RwLock<BTreeMap<PageKey, PageHeader>>>;
+pub type PagerBookMemoryHeader = RwLock<BTreeMap<PageKey, PageHeader>>;
 
 impl PageRegistry for PagerBookMemoryHeader {
     fn try_resolve_page(&self, key: &PageKey) -> io::Result<Option<PageHeader>> {
@@ -26,7 +26,7 @@ impl PageRegistry for PagerBookMemoryHeader {
         Ok(lock.get(key).cloned())
     }
 
-    fn resolve_page(&self, key: &PageKey) -> io::Result<PageHeader> {
+    fn resolve_page(&mut self, key: &PageKey) -> io::Result<PageHeader> {
         if let Some(page_header) = self.try_resolve_page(key)? {
             return Ok(page_header);
         }
@@ -36,27 +36,34 @@ impl PageRegistry for PagerBookMemoryHeader {
     }
 }
 
-#[derive(Clone)]
 pub struct PagerBook<Pager, Registry> {
     pager: Pager,
-    registry: Registry,
+    registry: RwLock<Registry>,
 }
 
 impl<P: Pager, R: PageRegistry> PagerBook<P, R> {
     pub fn new(pager: P, registry: R) -> Self {
         Self {
             pager,
-            registry,
+            registry: RwLock::new(registry),
         }
+    }
+
+    pub fn pager(&mut self) -> &mut P {
+        &mut self.pager
+    }
+
+    pub fn registry(&mut self) -> io::Result<&mut R> {
+        self.registry.get_mut().map_err(|_| io::Error::new(io::ErrorKind::Other, "Lock poisoned"))
     }
 }
 
-impl<P: Pager + Clone, R: PageRegistry + Clone> Book for PagerBook<P, R> {
-    type Section = PagerBookSection<P, R>;
+impl<P: Pager, R: PageRegistry> Book for PagerBook<P, R> {
+    type Section<'a> = PagerBookSection<'a, P, R> where Self: 'a;
 
-    fn section(&self, section_index: SectionIndex) -> Self::Section {
+    fn section(&self, section_index: SectionIndex) -> Self::Section<'_> {
         PagerBookSection {
-            book: self.clone(),
+            book: self,
             section_index,
             current_page: None,
             section_offset: 0,
@@ -64,21 +71,31 @@ impl<P: Pager + Clone, R: PageRegistry + Clone> Book for PagerBook<P, R> {
     }
 }
 
-#[derive(Clone)]
-pub struct PagerBookSection<P: Pager, R: PageRegistry> {
-    book: PagerBook<P, R>,
+pub struct PagerBookSection<'a, P: Pager, R: PageRegistry> {
+    book: &'a PagerBook<P, R>,
     section_index: SectionIndex,
-    current_page: Option<(P::Page, SectionPageIndex)>,
+    current_page: Option<(P::Page<'a>, SectionPageIndex)>,
     section_offset: u64,
 }
 
-impl<P: Pager + Clone, R: PageRegistry + Clone> Section for PagerBookSection<P, R> {
+impl<'a, P: Pager, R: PageRegistry> Clone for PagerBookSection<'a, P, R> {
+    fn clone(&self) -> Self {
+        Self {
+            book: self.book,
+            section_index: self.section_index,
+            current_page: self.current_page.clone(),
+            section_offset: self.section_offset,
+        }
+    }
+}
+
+impl<'a, P: Pager, R: PageRegistry> Section for PagerBookSection<'a, P, R> {
     fn index(&self) -> SectionIndex {
         self.section_index
     }
 }
 
-impl<P: Pager, R: PageRegistry> PagerBookSection<P, R> {
+impl<'a, P: Pager, R: PageRegistry> PagerBookSection<'a, P, R> {
     fn try_fetch_current_page(&mut self) -> io::Result<()> {
         let section_page_index = (self.section_offset / self.book.pager.page_size() as u64) as SectionPageIndex;
         if let Some((_, current_section_page_index)) = &self.current_page {
@@ -91,14 +108,15 @@ impl<P: Pager, R: PageRegistry> PagerBookSection<P, R> {
             section_index: self.section_index,
             section_page_index,
         };
-        if let Some(page_header) = self.book.registry.try_resolve_page(&page_key)? {
+        let registry = self.book.registry.read().map_err(|_| io::Error::new(io::ErrorKind::Other, "Lock poisoned"))?;
+        if let Some(page_header) = registry.try_resolve_page(&page_key)? {
             let page = self.book.pager.page(page_header.pager_page_index)?;
             self.current_page = Some((page, section_page_index));
         }
         return Ok(());
     }
 
-    fn get_or_assign_current_page(&mut self) -> io::Result<&mut P::Page> {
+    fn get_or_assign_current_page(&mut self) -> io::Result<&mut P::Page<'a>> {
         self.try_fetch_current_page()?;
         let Self {
             section_offset,
@@ -114,14 +132,15 @@ impl<P: Pager, R: PageRegistry> PagerBookSection<P, R> {
             section_index: *section_index,
             section_page_index,
         };
-        let PageHeader { pager_page_index } = book.registry.resolve_page(&page_key)?;
+        let mut registry = book.registry.write().map_err(|_| io::Error::new(io::ErrorKind::Other, "Lock poisoned"))?;
+        let PageHeader { pager_page_index } = registry.resolve_page(&page_key)?;
         let page = book.pager.page(pager_page_index)?;
         *current_page = Some((page, section_page_index));
         Ok(&mut current_page.as_mut().unwrap().0)
     }
 }
 
-impl<P: Pager, R: PageRegistry> Read for PagerBookSection<P, R> {
+impl<'a, P: Pager, R: PageRegistry> Read for PagerBookSection<'a, P, R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let page_size = self.book.pager.page_size() as u64;
         let page_offset = self.section_offset % page_size;
@@ -139,7 +158,7 @@ impl<P: Pager, R: PageRegistry> Read for PagerBookSection<P, R> {
     }
 }
 
-impl<P: Pager, H: PageRegistry> Write for PagerBookSection<P, H> {
+impl<'a, P: Pager, R: PageRegistry> Write for PagerBookSection<'a, P, R> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let page_size = self.book.pager.page_size() as u64;
         let page_offset = self.section_offset % page_size;
@@ -160,7 +179,7 @@ impl<P: Pager, H: PageRegistry> Write for PagerBookSection<P, H> {
     }
 }
 
-impl<P: Pager, H: PageRegistry> Seek for PagerBookSection<P, H> {
+impl<'a, P: Pager, R: PageRegistry> Seek for PagerBookSection<'a, P, R> {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         let new_offset = match pos {
             SeekFrom::Start(offset) => offset,
@@ -205,7 +224,7 @@ mod tests {
     use std::io::{Read, Seek, SeekFrom, Write};
 
     fn create_test_book(page_size: PageSize) -> PagerBook<MemoryPager, PagerBookMemoryHeader> {
-        PagerBook::new(MemoryPager::new(page_size), Arc::new(RwLock::new(BTreeMap::new())))
+        PagerBook::new(MemoryPager::new(page_size), RwLock::new(BTreeMap::new()))
     }
 
     #[test]

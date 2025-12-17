@@ -1,5 +1,5 @@
 use core::slice;
-use std::{fs::{self, create_dir_all}, io::{self}, path::Path, sync::{Arc, RwLock}};
+use std::{fs::{self, create_dir_all}, io::{self}, path::Path};
 
 use crate::{dbms::{index_registry::IndexEvent, section_registry::SectionEvent, wal::{ConvertWAL, FileWAL, FileWALReader, SerializableEvent, WALReader}}, pager::{PageSize, fs::FilePager}};
 use crate::hash_table::{self, HashTable, book::{BookHashTable, IndexChunkSize}, prefix_hasher::PrefixHasherBuilder};
@@ -127,7 +127,7 @@ type TWAL = FileWAL<HashTableEvent>;
 type TPager = FilePager;
 
 type TPageRegistryWal = ConvertWAL<PageEvent, TWAL>;
-type TPageRegistry = Arc<RwLock<ManagedPageRegistry<TPageRegistryWal>>>;
+type TPageRegistry = ManagedPageRegistry<TPageRegistryWal>;
 
 type TBook = PagerBook<
     TPager,
@@ -135,10 +135,10 @@ type TBook = PagerBook<
 >;
 
 type TSectionRegistryWal = ConvertWAL<SectionEvent, TWAL>;
-type TSectionRegistry = Arc<RwLock<ManagedSectionRegistry<TSectionRegistryWal>>>;
+type TSectionRegistry = ManagedSectionRegistry<TSectionRegistryWal>;
 
 type TIndexRegistryWal = ConvertWAL<IndexEvent, TWAL>;
-type TIndexRegistry = Arc<RwLock<ManagedIndexRegistry<TIndexRegistryWal>>>;
+type TIndexRegistry = ManagedIndexRegistry<TIndexRegistryWal>;
 
 type THashTable = BookHashTable<
     PrefixHasherBuilder,
@@ -154,10 +154,6 @@ type THashTable = BookHashTable<
 /// - `insert` operations are O(1) on average, and duration depends on the size of the entry being inserted.
 pub struct ManagedHashTable {
     hash_table: THashTable,
-    pager: TPager,
-    page_registry: TPageRegistry,
-    section_registry: TSectionRegistry,
-    index_registry: TIndexRegistry,
     wal: TWAL,
 }
 
@@ -255,36 +251,26 @@ impl ManagedHashTable {
         }
 
         let wal = FileWAL::load(wal_reader.into_file())?;
-        let page_registry = Arc::new(RwLock::new(
-            ManagedPageRegistry::with_wal(page_registry, ConvertWAL::new(wal.clone())),
-        ));
-        let section_registry = Arc::new(RwLock::new(
-            ManagedSectionRegistry::with_wal(section_registry, ConvertWAL::new(wal.clone())),
-        ));
-        let index_registry = Arc::new(RwLock::new(
-            ManagedIndexRegistry::with_wal(index_registry, ConvertWAL::new(wal.clone())),
-        ));
+        let page_registry = ManagedPageRegistry::with_wal(page_registry, ConvertWAL::new(wal.clone()));
+        let section_registry = ManagedSectionRegistry::with_wal(section_registry, ConvertWAL::new(wal.clone()));
+        let index_registry = ManagedIndexRegistry::with_wal(index_registry, ConvertWAL::new(wal.clone()));
 
         let book = PagerBook::new(
-            pager.clone(),
-            page_registry.clone(),
+            pager,
+            page_registry,
         );
 
         let hash_table = BookHashTable::new(
             PrefixHasherBuilder,
             book,
             header.config.section_count,
-            section_registry.clone(),
+            section_registry,
             header.config.index_chunk_size,
-            index_registry.clone(),
+            index_registry,
         );
 
         let mut managed = ManagedHashTable {
             hash_table,
-            pager,
-            page_registry,
-            section_registry,
-            index_registry,
             wal,
         };
 
@@ -296,7 +282,7 @@ impl ManagedHashTable {
 
 impl ManagedHashTable {
     pub fn sync(&mut self) -> io::Result<()> {
-        self.pager.sync()?;
+        self.hash_table.book().pager().sync()?;
         self.wal.sync()?;
 
         Ok(())
@@ -306,13 +292,12 @@ impl ManagedHashTable {
         self.sync()?;
 
         // TODO: Acquire locks in a consistent order to avoid deadlocks
-        let mut page_registry = self.page_registry.write().map_err(|_| io::Error::new(io::ErrorKind::Other, "Lock poisoned"))?;
-        let mut section_registry = self.section_registry.write().map_err(|_| io::Error::new(io::ErrorKind::Other, "Lock poisoned"))?;
-        let mut index_registry = self.index_registry.write().map_err(|_| io::Error::new(io::ErrorKind::Other, "Lock poisoned"))?;
 
-        page_registry.save()?;
-        section_registry.save()?;
-        index_registry.save()?;
+        self.hash_table.book().registry()?.save()?;
+
+        self.hash_table.section_registry().save()?;
+
+        self.hash_table.index_registry().save()?;
 
         self.wal.clear()?;
 
@@ -325,7 +310,7 @@ impl HashTable for ManagedHashTable {
         self.hash_table.insert(key, value)
     }
 
-    fn scan(&self, filter: hash_table::HashTableScanFilter) -> io::Result<impl hash_table::HashTableScanner> {
+    fn scan<'a>(&'a self, filter: hash_table::HashTableScanFilter<'a>) -> io::Result<impl hash_table::HashTableScanner + 'a> {
         self.hash_table.scan(filter)
     }
 }

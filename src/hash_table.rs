@@ -10,7 +10,7 @@ pub enum HashTableScanFilter<'key> {
 
 pub trait HashTable {
     fn insert(&mut self, key: &[u8], value: &[u8]) -> io::Result<()>;
-    fn scan(&self, filter: HashTableScanFilter) -> io::Result<impl HashTableScanner>;
+    fn scan<'a>(&'a self, filter: HashTableScanFilter<'a>) -> io::Result<impl HashTableScanner + 'a>;
 }
 
 pub type Hash = u32;

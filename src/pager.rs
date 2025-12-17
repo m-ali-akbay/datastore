@@ -8,12 +8,12 @@ pub type PageIndex = u32;
 pub type PageSize = u32;
 
 pub trait Pager {
-    type Page: Page;
+    type Page<'a>: Page + 'a where Self: 'a;
 
     /// Returns the size of each page in bytes.
     fn page_size(&self) -> PageSize;
 
-    fn page(&self, page_index: PageIndex) -> io::Result<Self::Page>;
+    fn page<'a>(&'a self, page_index: PageIndex) -> io::Result<Self::Page<'a>>;
 }
 
 pub trait Page: Read + Write + Seek + Clone {

@@ -62,9 +62,21 @@ impl<H: SliceHasherBuilder, B: Book, SR: SectionRegistry, IR: IndexRegistry> Boo
             index_registry,
         }
     }
+
+    pub fn book(&mut self) -> &mut B {
+        &mut self.book
+    }
+
+    pub fn section_registry(&mut self) -> &mut SR {
+        &mut self.section_registry
+    }
+
+    pub fn index_registry(&mut self) -> &mut IR {
+        &mut self.index_registry
+    }
 }
 
-impl<H: SliceHasherBuilder, B: Book, SR: SectionRegistry, IR: IndexRegistry + Clone> HashTable for BookHashTable<H, B, SR, IR> {
+impl<H: SliceHasherBuilder, B: Book, SR: SectionRegistry, IR: IndexRegistry> HashTable for BookHashTable<H, B, SR, IR> {
     fn insert(&mut self, key: &[u8], value: &[u8]) -> io::Result<()> {
         let mut hasher = self.hasher_builder.build();
         hasher.update(key);
@@ -101,7 +113,7 @@ impl<H: SliceHasherBuilder, B: Book, SR: SectionRegistry, IR: IndexRegistry + Cl
         Ok(())
     }
 
-    fn scan(&self, filter: HashTableScanFilter) -> io::Result<impl HashTableScanner> {
+    fn scan<'a>(&'a self, filter: HashTableScanFilter<'a>) -> io::Result<impl HashTableScanner + 'a> {
         let section_index = match filter {
             HashTableScanFilter::All => None,
             HashTableScanFilter::Key(key) => {
@@ -136,7 +148,7 @@ impl<H: SliceHasherBuilder, B: Book, SR: SectionRegistry, IR: IndexRegistry + Cl
                         bloom_query,
                         index_chunk: None,
                         index_chunk_size: self.index_chunk_size,
-                        index_registry: self.index_registry.clone(),
+                        index_registry: &self.index_registry,
                     }),
                     _ => SectionScannerIterator::None,
                 }
@@ -145,7 +157,7 @@ impl<H: SliceHasherBuilder, B: Book, SR: SectionRegistry, IR: IndexRegistry + Cl
                 // TODO: optimize this by supporting iterating non-empty sections only
                 (0..self.section_count)
                     .map(|section_index| (section_index, self.section_registry.resolve_section(section_index)))
-                    .map(move |(section_index, section_header)| -> io::Result<SectionScanner<B::Section, IR>> {
+                    .map(move |(section_index, section_header)| -> io::Result<SectionScanner<B::Section<'_>, IR>> {
                         let section_header = section_header?;
                         Ok(SectionScanner {
                             section: self.book.section(section_index),
@@ -154,7 +166,7 @@ impl<H: SliceHasherBuilder, B: Book, SR: SectionRegistry, IR: IndexRegistry + Cl
                             bloom_query,
                             index_chunk: None,
                             index_chunk_size: self.index_chunk_size,
-                            index_registry: self.index_registry.clone(),
+                            index_registry: &self.index_registry,
                         })
                     })
             ),
@@ -215,13 +227,13 @@ impl<'key, Scanner: HashTableScanner> HashTableScanner for FilterScanner<'key, S
     }
 }
 
-struct MultiSectionScanner<IR, Section, I: Iterator<Item = io::Result<SectionScanner<Section, IR>>>> {
+struct MultiSectionScanner<'a, IR, Section, I: Iterator<Item = io::Result<SectionScanner<'a, Section, IR>>>> {
     scanners: I,
-    current_scanner: Option<SectionScanner<Section, IR>>,
+    current_scanner: Option<SectionScanner<'a, Section, IR>>,
 }
 
-impl<IR: IndexRegistry + Clone, Section: Read + Seek + Clone, I: Iterator<Item = io::Result<SectionScanner<Section, IR>>>> HashTableScanner for MultiSectionScanner<IR, Section, I> {
-    fn next(&mut self) -> io::Result<Option<impl HashTableEntry + use<IR, Section, I>>> {
+impl<'a, IR: IndexRegistry, Section: Read + Seek + Clone, I: Iterator<Item = io::Result<SectionScanner<'a, Section, IR>>>> HashTableScanner for MultiSectionScanner<'a, IR, Section, I> {
+    fn next(&mut self) -> io::Result<Option<impl HashTableEntry + use<'a, IR, Section, I>>> {
         loop {
             if let Some(scanner) = &mut self.current_scanner {
                 if let Some(entry) = scanner.next()? {
@@ -238,14 +250,14 @@ impl<IR: IndexRegistry + Clone, Section: Read + Seek + Clone, I: Iterator<Item =
     }
 }
 
-enum SectionScannerIterator<Section, IR, I: Iterator<Item = io::Result<SectionScanner<Section, IR>>>> {
-    Single(SectionScanner<Section, IR>),
+enum SectionScannerIterator<'a, Section, IR, I: Iterator<Item = io::Result<SectionScanner<'a, Section, IR>>>> {
+    Single(SectionScanner<'a, Section, IR>),
     None,
     Many(I),
 }
 
-impl<IR, Section, I: Iterator<Item = io::Result<SectionScanner<Section, IR>>>> Iterator for SectionScannerIterator<Section, IR, I> {
-    type Item = io::Result<SectionScanner<Section, IR>>;
+impl<'a, IR, Section, I: Iterator<Item = io::Result<SectionScanner<'a, Section, IR>>>> Iterator for SectionScannerIterator<'a, Section, IR, I> {
+    type Item = io::Result<SectionScanner<'a, Section, IR>>;
 
     fn next(&mut self) -> Option<Self::Item> {
         match self {
@@ -263,14 +275,14 @@ impl<IR, Section, I: Iterator<Item = io::Result<SectionScanner<Section, IR>>>> I
     }
 }
 
-struct SectionScanner<Section, IR> {
+struct SectionScanner<'a, Section, IR> {
     section: Section,
     section_index: SectionIndex,
     section_end: u64,
     bloom_query: Option<u64>,
     index_chunk: Option<(IndexKey, IndexHeader)>,
     index_chunk_size: IndexChunkSize,
-    index_registry: IR,
+    index_registry: &'a IR,
 }
 
 struct ScannerEntry<Reader: Read + Seek + Clone> {
@@ -279,7 +291,7 @@ struct ScannerEntry<Reader: Read + Seek + Clone> {
     value_size: u32,
 }
 
-impl<Reader: Read + Seek + Clone, IR: IndexRegistry> SectionScanner<Reader, IR> {
+impl<Reader: Read + Seek + Clone, IR: IndexRegistry> SectionScanner<'_, Reader, IR> {
     fn next(&mut self) -> io::Result<Option<ScannerEntry<Reader>>> {
         let mut position = self.section.stream_position()?;
 

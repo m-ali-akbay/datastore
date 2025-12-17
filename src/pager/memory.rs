@@ -2,28 +2,21 @@ use std::{collections::BTreeMap, io::{self, Read, Seek, Write}, sync::{Arc, RwLo
 
 use crate::pager::{Page, PageIndex, PageSize, Pager};
 
-struct MemoryPagerInner {
+pub struct MemoryPager {
     page_size: PageSize,
     pages: RwLock<BTreeMap<PageIndex, Arc<RwLock<Box<[u8]>>>>>,
-}
-
-#[derive(Clone)]
-pub struct MemoryPager {
-    inner: Arc<MemoryPagerInner>,
 }
 
 impl MemoryPager {
     pub fn new(page_size: PageSize) -> Self {
         Self {
-            inner: Arc::new(MemoryPagerInner {
-                page_size,
-                pages: RwLock::new(BTreeMap::new()),
-            }),
+            page_size,
+            pages: RwLock::new(BTreeMap::new()),
         }
     }
 
     pub fn export<T>(&self, callback: impl FnOnce(&mut dyn Iterator<Item = (PageIndex, RwLockReadGuard<Box<[u8]>>)>) -> T) -> io::Result<T> {
-        let pages = self.inner.pages.read().map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "Poisoned lock"))?;
+        let pages = self.pages.read().map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "Poisoned lock"))?;
         let pages = pages.iter()
             .map(|(index, page)| page.read().map(|page|(*index, page)).map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "Poisoned lock")));
         let pages: Vec<_> = pages.collect::<io::Result<_>>()?;
@@ -32,16 +25,16 @@ impl MemoryPager {
 }
 
 impl Pager for MemoryPager {
-    type Page = MemoryPage;
+    type Page<'a> = MemoryPage<'a>;
 
     fn page_size(&self) -> PageSize {
-        self.inner.page_size
+        self.page_size
     }
     
-    fn page(&self, page_index: PageIndex) -> io::Result<Self::Page> {
+    fn page<'a>(&'a self, page_index: PageIndex) -> io::Result<Self::Page<'a>> {
         return Ok(MemoryPage {
             index: page_index,
-            pager: self.clone(),
+            pager: self,
             page: None,
             offset: 0,
         });
@@ -49,19 +42,19 @@ impl Pager for MemoryPager {
 }
 
 #[derive(Clone)]
-pub struct MemoryPage {
+pub struct MemoryPage<'a> {
     index: PageIndex,
-    pager: MemoryPager,
+    pager: &'a MemoryPager,
     page: Option<Arc<RwLock<Box<[u8]>>>>,
     offset: u64,
 }
 
-impl MemoryPage {
+impl<'a> MemoryPage<'a> {
     fn try_get(&mut self) -> io::Result<Option<Arc<RwLock<Box<[u8]>>>>> {
         if let Some(page) = &self.page {
             return Ok(Some(page.clone()));
         }
-        let pages = self.pager.inner.pages.read().map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "Poisoned lock"))?;
+        let pages = self.pager.pages.read().map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "Poisoned lock"))?;
         if let Some(page) = pages.get(&self.index) {
             self.page = Some(page.clone());
             return Ok(Some(page.clone()));
@@ -74,22 +67,22 @@ impl MemoryPage {
             return Ok(page);
         }
         drop(self.page.take());
-        let mut pages = self.pager.inner.pages.write().map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "Poisoned lock"))?;
+        let mut pages = self.pager.pages.write().map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "Poisoned lock"))?;
         let page = pages.entry(self.index).or_insert_with(|| {
-            Arc::new(RwLock::new(vec![0u8; self.pager.inner.page_size as usize].into_boxed_slice()))
+            Arc::new(RwLock::new(vec![0u8; self.pager.page_size as usize].into_boxed_slice()))
         });
         self.page = Some(page.clone());
         Ok(page.clone())
     }   
 }
 
-impl Page for MemoryPage {
+impl Page for MemoryPage<'_> {
     fn index(&self) -> PageIndex {
         self.index
     }
 }
 
-impl Read for MemoryPage {
+impl Read for MemoryPage<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let page_size = self.pager.page_size() as u64;
         if self.offset == page_size {
@@ -111,7 +104,7 @@ impl Read for MemoryPage {
     }
 }
 
-impl Write for MemoryPage {
+impl Write for MemoryPage<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let page_size = self.pager.page_size() as u64;
         let write_size = (page_size - self.offset).min(buf.len() as u64) as usize;
@@ -129,7 +122,7 @@ impl Write for MemoryPage {
     }
 }
 
-impl Seek for MemoryPage {
+impl Seek for MemoryPage<'_> {
     fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
         let page_size = self.pager.page_size() as u64;
         let (anchor, offset, is_forward) = match pos {

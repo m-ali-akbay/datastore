@@ -6,8 +6,8 @@ pub type SectionIndex = u32;
 pub type SectionPageIndex = u32;
 
 pub trait Book {
-    type Section: Section;
-    fn section(&self, section_index: SectionIndex) -> Self::Section;
+    type Section<'a>: Section where Self: 'a;
+    fn section(&self, section_index: SectionIndex) -> Self::Section<'_>;
 }
 
 pub trait Section: Read + Write + Seek + Clone {
